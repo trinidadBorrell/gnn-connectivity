@@ -1,0 +1,17 @@
+# Core dependencies
+torch>=2.0.0
+torch-geometric>=2.3.0
+numpy>=1.24.0
+scipy>=1.10.0
+matplotlib>=3.7.0
+pandas>=2.0.0
+
+# EEG processing
+mne>=1.5.0
+eeg-positions>=0.1.0
+
+# Machine learning
+scikit-learn>=1.3.0
+
+# Hyperparameter tuning (optional)
+ray[tune]>=2.0.0
