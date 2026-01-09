@@ -364,8 +364,187 @@ class TrainGAE:
         
         if save_results:
             self.save_model_and_visualizations(model, config, loss_history, output_dir, experiment_name)
+            # Save latent space representations for all subsets
+            self.save_latent_spaces(model, output_dir, experiment_name, device)
+            # Create visualizations for each subset
+            self._create_subset_visualizations(model, config, output_dir, experiment_name, device)
         
         return model
+    
+    def save_latent_spaces(self, model, output_dir, experiment_name, device=None):
+        """
+        Save latent space representations for train, val, and test sets.
+        
+        Saves a JSON file for each subset with structure:
+        {
+            "electrodes": ["Fp1", "Fp2", ...],
+            "data": {
+                "subject_id": {
+                    "session_num": {
+                        "matrix_idx": [[latent_0, latent_1], [latent_0, latent_1], ...]
+                    }
+                }
+            }
+        }
+        
+        Also saves the raw latent tensors as .pt files.
+        """
+        import json
+        
+        if device is None:
+            device = next(model.parameters()).device
+        
+        latent_dir = os.path.join(output_dir, 'latent_space')
+        os.makedirs(latent_dir, exist_ok=True)
+        
+        model.eval()
+        
+        subsets = {
+            'train': self.train_graphs,
+            'val': self.val_graphs,
+            'test': self.test_graphs
+        }
+        
+        for subset_name, graphs in subsets.items():
+            latent_json = {"electrodes": None, "data": {}}
+            latent_tensors = []
+            
+            with torch.no_grad():
+                for graph in graphs:
+                    graph_device = graph.to(device)
+                    z = model.encode(graph_device.x, graph_device.edge_index)
+                    
+                    # Get metadata from graph (stored during preprocessing)
+                    subject_id = str(getattr(graph, 'subject_id', 'unknown'))
+                    session_num = str(getattr(graph, 'session_num', 'unknown'))
+                    matrix_idx = str(getattr(graph, 'matrix_idx', -1))
+                    electrode_labels = getattr(graph, 'electrode_labels', None)
+                    
+                    # Store electrode labels (only need to do once)
+                    if latent_json["electrodes"] is None and electrode_labels is not None:
+                        latent_json["electrodes"] = electrode_labels
+                    
+                    # Store full node-level latent vectors (no aggregation)
+                    z_np = z.cpu().numpy().tolist()  # Shape: [n_nodes, latent_dim]
+                    latent_tensors.append(z.cpu())
+                    
+                    # Build nested structure: subject -> session -> matrix
+                    if subject_id not in latent_json["data"]:
+                        latent_json["data"][subject_id] = {}
+                    if session_num not in latent_json["data"][subject_id]:
+                        latent_json["data"][subject_id][session_num] = {}
+                    
+                    latent_json["data"][subject_id][session_num][matrix_idx] = z_np
+            
+            # Save as JSON
+            json_path = os.path.join(latent_dir, f'{subset_name}_latent_{experiment_name}.json')
+            with open(json_path, 'w') as f:
+                json.dump(latent_json, f, indent=2)
+            print(f"Latent space ({subset_name}) saved to: {json_path}")
+            
+            # Save raw tensors
+            pt_path = os.path.join(latent_dir, f'{subset_name}_latent_tensors_{experiment_name}.pt')
+            torch.save(latent_tensors, pt_path)
+        
+        print(f"\nLatent space files saved to: {latent_dir}")
+    
+    def _create_subset_visualizations(self, model, config, output_dir, experiment_name, device=None):
+        """Create GAE visualization for each subset (train, val, test)."""
+        if device is None:
+            device = next(model.parameters()).device
+        
+        plots_dir = os.path.join(output_dir, 'plots')
+        os.makedirs(plots_dir, exist_ok=True)
+        
+        subsets = {
+            'train': self.train_graphs,
+            'val': self.val_graphs,
+            'test': self.test_graphs
+        }
+        
+        for subset_name, graphs in subsets.items():
+            self._create_gae_visualization_for_subset(
+                model, config, graphs, subset_name, plots_dir, experiment_name, device
+            )
+    
+    def _create_gae_visualization_for_subset(self, model, config, graphs, subset_name, plots_dir, experiment_name, device):
+        """Create 5x4 grid visualization for a specific subset."""
+        import numpy as np
+        
+        if len(graphs) == 0:
+            print(f"No graphs in {subset_name} subset, skipping visualization")
+            return
+        
+        num_samples = min(5, len(graphs))
+        indices = np.random.choice(len(graphs), num_samples, replace=False)
+        sample_graphs = [graphs[i] for i in indices]
+        
+        model.eval()
+        
+        fig, axes = plt.subplots(num_samples, 4, figsize=(20, 5 * num_samples))
+        if num_samples == 1:
+            axes = axes.reshape(1, -1)
+        
+        latent_dim = config.get('latent_dim', 2)
+        
+        with torch.no_grad():
+            for row_idx, graph in enumerate(sample_graphs):
+                graph = graph.to(device)
+                x_recon, z = model(graph.x, graph.edge_index)
+                
+                # Get metadata
+                subject_id = getattr(graph, 'subject_id', 'unknown')
+                matrix_idx = getattr(graph, 'matrix_idx', indices[row_idx])
+                
+                error_normalized = torch.abs(graph.x - x_recon)
+                
+                original = graph.x.cpu().numpy()
+                reconstruction = x_recon.cpu().numpy()
+                error_np = error_normalized.cpu().numpy()
+                latent = z.cpu().numpy()
+                
+                # Column 1: Original
+                im1 = axes[row_idx, 0].imshow(original, aspect='auto', cmap='viridis', vmin=-1, vmax=1)
+                axes[row_idx, 0].set_title(f'Sub-{subject_id} Mat-{matrix_idx}\nOriginal', fontsize=11, fontweight='bold')
+                axes[row_idx, 0].set_xlabel('Features')
+                axes[row_idx, 0].set_ylabel('Nodes')
+                plt.colorbar(im1, ax=axes[row_idx, 0])
+                
+                # Column 2: Reconstructed
+                im2 = axes[row_idx, 1].imshow(reconstruction, aspect='auto', cmap='viridis', vmin=-1, vmax=1)
+                axes[row_idx, 1].set_title('Reconstruction', fontsize=11, fontweight='bold')
+                axes[row_idx, 1].set_xlabel('Features')
+                axes[row_idx, 1].set_ylabel('Nodes')
+                plt.colorbar(im2, ax=axes[row_idx, 1])
+                
+                # Column 3: Error
+                im3 = axes[row_idx, 2].imshow(error_np, aspect='auto', cmap='Reds')
+                axes[row_idx, 2].set_title(f'Error (MAE: {error_np.mean():.4f})', fontsize=11, fontweight='bold')
+                axes[row_idx, 2].set_xlabel('Features')
+                axes[row_idx, 2].set_ylabel('Nodes')
+                plt.colorbar(im3, ax=axes[row_idx, 2])
+                
+                # Column 4: Latent Space
+                if latent_dim >= 2:
+                    scatter = axes[row_idx, 3].scatter(latent[:, 0], latent[:, 1], c=range(len(latent)), 
+                                                        cmap='viridis', s=30, alpha=0.7)
+                    axes[row_idx, 3].set_xlabel('Latent Dim 0')
+                    axes[row_idx, 3].set_ylabel('Latent Dim 1')
+                    cbar = plt.colorbar(scatter, ax=axes[row_idx, 3])
+                    cbar.set_label('Node Index')
+                else:
+                    axes[row_idx, 3].hist(latent[:, 0], bins=20, alpha=0.7)
+                    axes[row_idx, 3].set_xlabel('Latent Dim 0')
+                    axes[row_idx, 3].set_ylabel('Count')
+                axes[row_idx, 3].set_title('Latent Space (nodes)', fontsize=11, fontweight='bold')
+        
+        plt.suptitle(f'GAE Visualization - {subset_name.upper()} Set', fontsize=14, fontweight='bold', y=1.02)
+        plt.tight_layout()
+        
+        viz_path = os.path.join(plots_dir, f'gae_visualization_{subset_name}_{experiment_name}.png')
+        plt.savefig(viz_path, dpi=300, bbox_inches='tight')
+        print(f"GAE visualization ({subset_name}) saved to: {viz_path}")
+        plt.close()
 
 def main():
     """
