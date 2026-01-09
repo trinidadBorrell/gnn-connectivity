@@ -236,7 +236,7 @@ class EEGtoGraph:
         distance_matrix: np.ndarray,
         k: int = 6,
         output_dir: str = None,
-        save: bool = False
+        save: bool = True
     ):
         """
         Plot the k nearest neighbors for each sensor in an 8x8 grid.
@@ -292,7 +292,9 @@ class EEGtoGraph:
         
         if save and output_dir:
             num_electrodes = len(coords_df)
-            output_path = os.path.join('/Users/trinidad.borrell/Documents/Work/PhD/Proyects/VGAE/gnn/output/preprocessing/data', 'images', f'k_nearest_neighbours_k{k}_{num_electrodes}_electrodes.png')
+            if not os.path.exists(f'{output_dir}/images'):
+                os.makedirs(f'{output_dir}/images')
+            output_path = os.path.join(output_dir, 'images', f'k_nearest_neighbours_k{k}_{num_electrodes}_electrodes.png')
             plt.savefig(output_path, dpi=300, bbox_inches='tight')
             print(f"Saved k-nearest neighbors plot to: {output_path}")
             plt.close()
@@ -306,7 +308,7 @@ class EEGtoGraph:
         k: int,
         output_dir: str,
         save: bool = True,
-        plot_neighbors: bool = False
+        plot_neighbors: bool = True
     ):
         """
         Create a sparse adjacency matrix based on k-nearest neighbors in Cartesian coordinates.
@@ -763,6 +765,7 @@ class EEGtoGraph:
                         data.subject_id = subject_id
                         data.session_num = session_num
                         data.matrix_idx = matrix_idx
+                        data.electrode_labels = list(coords_df['label'].values)
                         dataset.append(data)
                         subject_ids.append(subject_id)
                         
