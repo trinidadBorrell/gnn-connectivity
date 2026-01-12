@@ -26,6 +26,13 @@ import matplotlib.pyplot as plt
 import os
 from datetime import datetime
 from model import GAE
+
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    print("wandb not installed. Install with: pip install wandb")
 #import ray
 #from ray import tune
 #from ray.tune.schedulers import ASHAScheduler
@@ -294,8 +301,17 @@ class TrainGAE:
         print(f"GAE visualization saved to: {viz_path}")
         plt.close()
 
-    def train_final(self, config, save_results=False, output_dir='../output/training', experiment_name=None):
-        """Train final model on train+val with best config, evaluate on test."""
+    def train_final(self, config, save_results=False, output_dir='../output/training', experiment_name=None, use_wandb=True, wandb_project='gnn-connectivity'):
+        """Train final model on train+val with best config, evaluate on test.
+        
+        Args:
+            config: Configuration dict with hyperparameters
+            save_results: Whether to save model and visualizations
+            output_dir: Directory to save outputs
+            experiment_name: Name for this experiment
+            use_wandb: Whether to use wandb for logging (default: True)
+            wandb_project: wandb project name (default: 'gnn-connectivity')
+        """
         print(f"\n{'='*60}")
         print("Training Final Model on Train+Val")
         print(f"{'='*60}\n")
@@ -304,6 +320,20 @@ class TrainGAE:
         device = torch.device('cuda' if torch.cuda.is_available() else 
                              'mps' if torch.backends.mps.is_available() else 'cpu')
         print(f"Using device: {device}")
+        
+        # Initialize wandb
+        if use_wandb and WANDB_AVAILABLE:
+            wandb.init(
+                project=wandb_project,
+                name=experiment_name or datetime.now().strftime("%Y%m%d_%H%M%S"),
+                config=config,
+                tags=["GAE", "training"]
+            )
+            wandb.config.update({"device": str(device)})
+            print("wandb initialized successfully")
+        elif use_wandb and not WANDB_AVAILABLE:
+            print("wandb requested but not available. Continuing without wandb.")
+            use_wandb = False
         
         # Combine train and val for final training
         combined_graphs = self.train_graphs + self.val_graphs
@@ -348,9 +378,20 @@ class TrainGAE:
             if train_loss < best_loss:
                 best_loss = train_loss
             
+            # Get current learning rate
+            current_lr = optimizer.param_groups[0]['lr']
+            
+            # Log to wandb
+            if use_wandb and WANDB_AVAILABLE:
+                wandb.log({
+                    "epoch": epoch,
+                    "train_loss": train_loss,
+                    "best_loss": best_loss,
+                    "learning_rate": current_lr
+                })
+            
             if epoch % 10 == 0:
-                lr = optimizer.param_groups[0]['lr']
-                print(f'Epoch {epoch:03d}, Loss: {train_loss:.6f}, LR: {lr:.6f}')
+                print(f'Epoch {epoch:03d}, Loss: {train_loss:.6f}, LR: {current_lr:.6f}')
         
         # Final evaluation on test set
         test_mse = compute_mse_on_graphs(model, self.test_graphs, device=device)
@@ -362,12 +403,25 @@ class TrainGAE:
         print(f"Best Train Loss: {best_loss:.6f}")
         print(f"{'='*60}\n")
         
+        # Log final metrics to wandb
+        if use_wandb and WANDB_AVAILABLE:
+            wandb.log({
+                "test_mse": test_mse,
+                "final_best_loss": best_loss
+            })
+            wandb.summary["test_mse"] = test_mse
+            wandb.summary["best_train_loss"] = best_loss
+        
         if save_results:
             self.save_model_and_visualizations(model, config, loss_history, output_dir, experiment_name)
             # Save latent space representations for all subsets
             self.save_latent_spaces(model, output_dir, experiment_name, device)
             # Create visualizations for each subset
             self._create_subset_visualizations(model, config, output_dir, experiment_name, device)
+        
+        # Finish wandb run
+        if use_wandb and WANDB_AVAILABLE:
+            wandb.finish()
         
         return model
     
@@ -584,6 +638,10 @@ def main():
                         help='Name for this experiment (defaults to timestamp)')
     parser.add_argument('--num_samples', type=int, default=10,
                         help='Number of Ray Tune samples (default: 10)')
+    parser.add_argument('--wandb', action='store_true',
+                        help='Enable wandb logging for training metrics')
+    parser.add_argument('--wandb_project', type=str, default='gnn-connectivity',
+                        help='wandb project name (default: gnn-connectivity)')
     
     args = parser.parse_args()
 
@@ -684,7 +742,9 @@ def main():
         config=best_config,
         save_results=args.save,
         output_dir=args.output_dir,
-        experiment_name=args.experiment_name
+        experiment_name=args.experiment_name,
+        use_wandb=args.wandb,
+        wandb_project=args.wandb_project
     )
     
     return final_model, trainer

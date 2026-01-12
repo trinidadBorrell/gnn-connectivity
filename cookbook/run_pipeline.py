@@ -201,7 +201,9 @@ def run_training(args, dataset_train, dataset_val, dataset_test):
         config=config,
         save_results=True,
         output_dir=training_dir,
-        experiment_name=experiment_name
+        experiment_name=experiment_name,
+        use_wandb=args.wandb,
+        wandb_project=args.wandb_project
     )
     
     return final_model, training_dir
@@ -268,6 +270,12 @@ def main():
                         help='Directory to save all outputs')
     parser.add_argument('--experiment_name', type=str, default=None,
                         help='Name for this experiment (defaults to timestamp)')
+    
+    # Experiment tracking
+    parser.add_argument('--wandb', action='store_true',
+                        help='Enable wandb logging for training metrics')
+    parser.add_argument('--wandb_project', type=str, default='gnn-connectivity',
+                        help='wandb project name (default: gnn-connectivity)')
     
     # Pipeline control
     parser.add_argument('--skip_preprocessing', action='store_true',
