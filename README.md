@@ -10,6 +10,7 @@ A Graph Neural Network (GNN) based pipeline for analyzing EEG connectivity data 
 - **Configurable Architecture**: Progressive dimension reduction (e.g., 64→64→32→16→2)
 - **Learning Rate Scheduler**: ReduceLROnPlateau for optimal convergence
 - **Multi-Electrode Support**: Works with any EEG electrode configuration
+- **Experiment Tracking**: Optional wandb integration for real-time metrics visualization
 
 ## Installation
 
@@ -56,6 +57,20 @@ python cookbook/run_pipeline.py \
     --n_epochs 200 \
     --dropout 0.2 \
     --lr 0.001
+```
+
+### Option 5: With Wandb Logging
+
+```bash
+# First time: authenticate with wandb
+wandb login
+
+# Run with wandb enabled
+python cookbook/run_pipeline.py \
+    --main_path /path/to/eeg_data \
+    --coordinates_file data_scalp/biosemi64.txt \
+    --wandb \
+    --wandb_project my-gnn-project
 ```
 
 ## Directory Structure
@@ -189,6 +204,8 @@ verify_no_data_leakage(train_dataset, val_dataset, test_dataset)
 | `--n_epochs` | `200` | Training epochs |
 | `--lr` | `0.001` | Learning rate |
 | `--weight_decay` | `1e-5` | Adam weight decay |
+| `--wandb` | `False` | Enable wandb logging |
+| `--wandb_project` | `gnn-connectivity` | Wandb project name |
 
 ## Module Overview
 
@@ -265,6 +282,9 @@ config = {
 }
 
 model = trainer.train_final(config, save_results=True, output_dir='output/training')
+
+# With wandb logging
+model = trainer.train_final(config, save_results=True, output_dir='output/training', use_wandb=True)
 ```
 
 ### Inference (with trained model)
