@@ -31,11 +31,15 @@ Adaptability to Other Scalp Configurations:
 -------------------------------------------
 This pipeline is designed to work with any EEG electrode configuration:
 
-1. Create a new coordinates file in data_scalp/ listing electrode labels
-   (e.g., GSN-HydroCel-257.txt for 257-channel EGI system)
+1. For standard 10-20/10-10/10-05 systems:
+   - Create a file listing electrode labels (one per line or with coordinates)
+   - Run with --coordinate_system 1020|1010|1005 to use get_elec_coords
 
-2. Run with your coordinates file:
-   python cookbook/run_pipeline.py --coordinates_file data_scalp/your_system.txt ...
+2. For custom electrode systems (e.g., EGI GSN-HydroCel-257):
+   - Create a coordinates file with format: label x y z (space-separated)
+   - Run with --coordinate_system file to read coordinates directly from file:
+   python cookbook/run_pipeline.py --coordinates_file data_scalp/GSN-HydroCel-257.txt \
+       --coordinate_system file ...
 
 3. For pre-computed matrices, ensure:
    - Matrix rows match the number of electrodes in your coordinates file
@@ -57,23 +61,38 @@ from train import TrainGAE, normalize_graph_features
 from data_loaders import verify_no_data_leakage, save_datasets
 
 
-def load_electrode_coordinates(coordinates_file, channels=None):
+def load_electrode_coordinates(coordinates_file, channels=None, coordinate_system='1005'):
     """
     Load electrode coordinates from file.
     
     Args:
-        coordinates_file: Path to file with electrode labels
+        coordinates_file: Path to file with electrode labels (and optionally coordinates)
         channels: Optional list of specific channels to use
+        coordinate_system: One of '1020', '1010', '1005' to use standard systems via get_elec_coords,
+                          or 'file' to read coordinates directly from the coordinates_file
+                          (expects format: label x y z per line)
         
     Returns:
         coords_df: DataFrame with electrode coordinates
     """
-    from eeg_positions import get_elec_coords
     import numpy as np
+    import pandas as pd
     
-    labels = np.loadtxt(coordinates_file, usecols=(0,), dtype=str)
-    coords_data = get_elec_coords(system='1005', as_mne_montage=False)
-    coords_df = coords_data[coords_data['label'].isin(labels)].copy()
+    if coordinate_system == 'file':
+        # Read coordinates directly from file (format: label x y z)
+        data = np.loadtxt(coordinates_file, dtype=str)
+        coords_df = pd.DataFrame({
+            'label': data[:, 0],
+            'x': data[:, 1].astype(float),
+            'y': data[:, 2].astype(float),
+            'z': data[:, 3].astype(float)
+        })
+    else:
+        # Use standard electrode positioning system
+        from eeg_positions import get_elec_coords
+        labels = np.loadtxt(coordinates_file, usecols=(0,), dtype=str)
+        coords_data = get_elec_coords(system=coordinate_system, as_mne_montage=False)
+        coords_df = coords_data[coords_data['label'].isin(labels)].copy()
     
     if channels is not None:
         coords_df = coords_df[coords_df['label'].isin(channels)].copy()
@@ -111,6 +130,9 @@ def run_preprocessing(args, coords_df):
         print(f"Feature type: {args.feature_type}")
         print(f"Path pattern: {args.path_pattern or 'default'}")
     
+    if args.subject_filter:
+        print(f"Subject filter: {args.subject_filter.split(',')} (only processing listed subjects)")
+    
     # Create graph dataset
     dataset_train, dataset_val, dataset_test = EEGtoGraph.create_graph_dataset(
         coords_df=coords_df,
@@ -126,7 +148,8 @@ def run_preprocessing(args, coords_df):
         save=True,
         plot_neighbors=not args.no_plot_neighbors,
         n_splits=args.n_splits,
-        test_fold=args.test_fold
+        test_fold=args.test_fold,
+        subject_filter=args.subject_filter
     )
     
     # Verify no data leakage
@@ -217,14 +240,18 @@ def main():
     
     # Data source arguments (mutually exclusive unless skip_preprocessing)
     data_group = parser.add_mutually_exclusive_group()
-    data_group.add_argument('--main_path', type=str, default = '/Users/trinidad.borrell/Documents/Work/PhD/Proyects/VGAE/gnn_connectivity/data',
+    data_group.add_argument('--main_path', type=str, default = '/data/project/eeg_foundation/data/data_250Hz_EGI256/nice_epochs_from_cohen_2/nice_epochs/nice_epochs2',
                             help='Path to EEG data directory (for EEG mode)')
     data_group.add_argument('--matrix_dir', type=str,
                             help='Path to pre-computed matrices directory (for matrix mode)')
     
     # Required
-    parser.add_argument('--coordinates_file', type=str, default = '/Users/trinidad.borrell/Documents/Work/PhD/Proyects/VGAE/gnn_connectivity/data_scalp/biosemi64.txt',
+    parser.add_argument('--coordinates_file', type=str, default = '/home/triniborrell/home/projects/gnn_connectivity/data_scalp/GSN-HydroCel-257.txt',
                         help='Path to electrode coordinates file (e.g., data_scalp/biosemi64.txt)')
+    parser.add_argument('--coordinate_system', type=str, default='file',
+                        choices=['1020', '1010', '1005', 'file'],
+                        help="Coordinate system: '1020', '1010', '1005' for standard systems via get_elec_coords, "
+                             "or 'file' to read coordinates directly from coordinates_file (format: label x y z)")
     
     # Path patterns for flexibility
     parser.add_argument('--path_pattern', type=str, default=None,
@@ -246,6 +273,8 @@ def main():
                         help='Number of folds for GroupKFold (subject-level split)')
     parser.add_argument('--test_fold', type=int, default=0,
                         help='Which fold to use as test set')
+    parser.add_argument('--subject_filter', type=str, default=None,
+                        help='Comma-separated list of subject IDs to process (e.g., "AA164,BB178,AL012")')
     parser.add_argument('--no_plot_neighbors', action='store_true',
                         help='Skip k-nearest neighbors visualization (shown by default)')
     
@@ -308,15 +337,15 @@ def main():
         print(f"Feature type: {args.feature_type}")
     
     print(f"Output dir: {args.output_dir}")
-    print(f"Coordinates: {args.coordinates_file}")
+    print(f"Coordinates: {args.coordinates_file} (system: {args.coordinate_system})")
     if args.channels:
         print(f"Channels: {args.channels}")
     else:
         print("Channels: all")
     
     # Load electrode coordinates
-    coords_df = load_electrode_coordinates(args.coordinates_file, args.channels)
-    print(f"Loaded {len(coords_df)} electrode coordinates")
+    coords_df = load_electrode_coordinates(args.coordinates_file, args.channels, args.coordinate_system)
+    print(f"Loaded {len(coords_df)} electrode coordinates (system: {args.coordinate_system})")
     
     # Run preprocessing or load existing datasets
     if args.skip_preprocessing:
