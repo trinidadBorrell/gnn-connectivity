@@ -159,9 +159,12 @@ class EEGtoGraph:
         return matrices
 
     @staticmethod
-    def cartesian_distance(x1: float, y1: float, x2: float, y2: float) -> float:
-        """Calculate Euclidean distance between two points in 2D Cartesian coordinates."""
-        distance = np.sqrt((x1 - x2)**2 + (y1 - y2)**2)
+    def cartesian_distance(x1: float, y1: float, x2: float, y2: float, z1: float = None, z2: float = None) -> float:
+        """Calculate Euclidean distance between two points in 2D or 3D Cartesian coordinates."""
+        if z1 is not None and z2 is not None:
+            distance = np.sqrt((x1 - x2)**2 + (y1 - y2)**2 + (z1 - z2)**2)
+        else:
+            distance = np.sqrt((x1 - x2)**2 + (y1 - y2)**2)
         return distance
     
     @staticmethod
@@ -182,7 +185,7 @@ class EEGtoGraph:
         Find k nearest neighbors for each sensor using Cartesian distance.
         
         Args:
-            coords_df: DataFrame with columns ['label', 'x', 'y']
+            coords_df: DataFrame with columns ['label', 'x', 'y'] or ['label', 'x', 'y', 'z']
             k: Number of nearest neighbors
             
         Returns:
@@ -193,6 +196,8 @@ class EEGtoGraph:
         sensor_names = coords_df['label'].values
         X_array = coords_df['x'].values
         Y_array = coords_df['y'].values
+        has_z = 'z' in coords_df.columns
+        Z_array = coords_df['z'].values if has_z else None
         
         # Validate inputs
         if k >= n_sensors:
@@ -205,8 +210,10 @@ class EEGtoGraph:
             for j in range(i + 1, n_sensors):
                 x1, y1 = X_array[i], Y_array[i]
                 x2, y2 = X_array[j], Y_array[j]
+                z1 = Z_array[i] if has_z else None
+                z2 = Z_array[j] if has_z else None
                 
-                dist = EEGtoGraph.cartesian_distance(x1, y1, x2, y2)
+                dist = EEGtoGraph.cartesian_distance(x1, y1, x2, y2, z1, z2)
                 
                 distance_matrix[i, j] = dist
                 distance_matrix[j, i] = dist  # Symmetric
@@ -236,57 +243,124 @@ class EEGtoGraph:
         distance_matrix: np.ndarray,
         k: int = 6,
         output_dir: str = None,
-        save: bool = True
+        save: bool = True,
+        n_samples: int = None,
+        random_seed: int = 42
     ):
         """
-        Plot the k nearest neighbors for each sensor in an 8x8 grid.
+        Plot the k nearest neighbors for each sensor.
+        
+        For 2D coordinates (from eeg_positions): plots all sensors in a grid.
+        For 3D coordinates (from file): plots a random sample with x-y and x-z projections.
         
         Args:
-            coords_df: DataFrame with columns ['label', 'x', 'y']
+            coords_df: DataFrame with columns ['label', 'x', 'y'] or ['label', 'x', 'y', 'z']
             distance_matrix: Pairwise distance matrix
             k: Number of nearest neighbors to highlight
             output_dir: Directory to save plots (if save=True)
             save: Whether to save the plots
+            n_samples: Number of random electrodes to plot (default: all for 2D, 16 for 3D)
+            random_seed: Random seed for reproducibility when sampling
         """
         n_sensors = len(coords_df)
-        n_rows = int(np.ceil(np.sqrt(n_sensors)))
-        n_cols = int(np.ceil(n_sensors / n_rows))
+        has_z = 'z' in coords_df.columns
         
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(20, 20))
-        axes = axes.flatten() if n_sensors > 1 else [axes]
+        # Determine number of samples
+        if n_samples is None:
+            n_samples = 16 if has_z else n_sensors
+        n_samples = min(n_samples, n_sensors)
         
-        for i in range(n_sensors):
-            ax = axes[i]
-            row = distance_matrix[i, :]
-            
-            # Get indices of k smallest values (excluding self at index 0)
-            smallest_indices = np.argpartition(row, k+1)[:k+1]
-            # Remove self if distance is 0
-            smallest_indices = smallest_indices[row[smallest_indices] > 0][:k]
-            
-            # Plot all sensors in black
-            ax.plot(coords_df['x'], coords_df['y'], 'o', color='black', markersize=4, alpha=0.3)
-            
-            # Plot k nearest neighbors in red
-            df_neighbours = coords_df.iloc[smallest_indices]
-            ax.plot(df_neighbours['x'], df_neighbours['y'], 'o', color='red', markersize=6)
-            
-            # Plot current sensor in green
-            df_sensor = coords_df.iloc[i]
-            ax.plot(df_sensor['x'], df_sensor['y'], 'o', color='green', markersize=8)
-            
-            # Annotate labels
-            for idx, label in enumerate(coords_df['label']):
-                ax.annotate(label, (coords_df['x'].iloc[idx], coords_df['y'].iloc[idx]), 
-                           fontsize=6, alpha=0.7)
-            
-            ax.set_title(f"{df_sensor['label']}", fontsize=10, fontweight='bold')
-            ax.set_aspect('equal')
-            ax.grid(True, alpha=0.3)
+        # Select electrode indices to plot
+        if n_samples < n_sensors:
+            np.random.seed(random_seed)
+            sample_indices = np.random.choice(n_sensors, size=n_samples, replace=False)
+            sample_indices = np.sort(sample_indices)
+        else:
+            sample_indices = np.arange(n_sensors)
         
-        # Hide unused subplots
-        for i in range(n_sensors, len(axes)):
-            axes[i].axis('off')
+        if has_z:
+            # 3D coordinates: create side-by-side x-y and x-z projections for each sampled electrode
+            n_rows = int(np.ceil(np.sqrt(n_samples)))
+            n_cols = int(np.ceil(n_samples / n_rows))
+            
+            fig, axes = plt.subplots(n_rows, n_cols * 2, figsize=(24, 12))
+            axes = axes.reshape(-1, 2) if n_samples > 1 else [axes]
+            
+            for plot_idx, sensor_idx in enumerate(sample_indices):
+                ax_xy = axes[plot_idx][0]
+                ax_xz = axes[plot_idx][1]
+                row = distance_matrix[sensor_idx, :]
+                
+                # Get indices of k smallest values (excluding self)
+                smallest_indices = np.argpartition(row, k+1)[:k+1]
+                smallest_indices = smallest_indices[row[smallest_indices] > 0][:k]
+                
+                df_neighbours = coords_df.iloc[smallest_indices]
+                df_sensor = coords_df.iloc[sensor_idx]
+                
+                # X-Y projection
+                ax_xy.plot(coords_df['x'], coords_df['y'], 'o', color='black', markersize=3, alpha=0.2)
+                ax_xy.plot(df_neighbours['x'], df_neighbours['y'], 'o', color='red', markersize=5)
+                ax_xy.plot(df_sensor['x'], df_sensor['y'], 'o', color='green', markersize=7)
+                ax_xy.set_title(f"{df_sensor['label']} (X-Y)", fontsize=9, fontweight='bold')
+                ax_xy.set_xlabel('X')
+                ax_xy.set_ylabel('Y')
+                ax_xy.set_aspect('equal')
+                ax_xy.grid(True, alpha=0.3)
+                
+                # X-Z projection
+                ax_xz.plot(coords_df['x'], coords_df['z'], 'o', color='black', markersize=3, alpha=0.2)
+                ax_xz.plot(df_neighbours['x'], df_neighbours['z'], 'o', color='red', markersize=5)
+                ax_xz.plot(df_sensor['x'], df_sensor['z'], 'o', color='green', markersize=7)
+                ax_xz.set_title(f"{df_sensor['label']} (X-Z)", fontsize=9, fontweight='bold')
+                ax_xz.set_xlabel('X')
+                ax_xz.set_ylabel('Z')
+                ax_xz.set_aspect('equal')
+                ax_xz.grid(True, alpha=0.3)
+            
+            # Hide unused subplots
+            for plot_idx in range(n_samples, len(axes)):
+                axes[plot_idx][0].axis('off')
+                axes[plot_idx][1].axis('off')
+        else:
+            # 2D coordinates: original behavior with grid layout
+            n_rows = int(np.ceil(np.sqrt(n_samples)))
+            n_cols = int(np.ceil(n_samples / n_rows))
+            
+            fig, axes = plt.subplots(n_rows, n_cols, figsize=(20, 20))
+            axes = axes.flatten() if n_samples > 1 else [axes]
+            
+            for plot_idx, sensor_idx in enumerate(sample_indices):
+                ax = axes[plot_idx]
+                row = distance_matrix[sensor_idx, :]
+                
+                # Get indices of k smallest values (excluding self)
+                smallest_indices = np.argpartition(row, k+1)[:k+1]
+                smallest_indices = smallest_indices[row[smallest_indices] > 0][:k]
+                
+                # Plot all sensors in black
+                ax.plot(coords_df['x'], coords_df['y'], 'o', color='black', markersize=4, alpha=0.3)
+                
+                # Plot k nearest neighbors in red
+                df_neighbours = coords_df.iloc[smallest_indices]
+                ax.plot(df_neighbours['x'], df_neighbours['y'], 'o', color='red', markersize=6)
+                
+                # Plot current sensor in green
+                df_sensor = coords_df.iloc[sensor_idx]
+                ax.plot(df_sensor['x'], df_sensor['y'], 'o', color='green', markersize=8)
+                
+                # Annotate labels
+                for idx, label in enumerate(coords_df['label']):
+                    ax.annotate(label, (coords_df['x'].iloc[idx], coords_df['y'].iloc[idx]), 
+                               fontsize=6, alpha=0.7)
+                
+                ax.set_title(f"{df_sensor['label']}", fontsize=10, fontweight='bold')
+                ax.set_aspect('equal')
+                ax.grid(True, alpha=0.3)
+            
+            # Hide unused subplots
+            for plot_idx in range(n_samples, len(axes)):
+                axes[plot_idx].axis('off')
         
         plt.tight_layout()
         
@@ -294,7 +368,8 @@ class EEGtoGraph:
             num_electrodes = len(coords_df)
             if not os.path.exists(f'{output_dir}/images'):
                 os.makedirs(f'{output_dir}/images')
-            output_path = os.path.join(output_dir, 'images', f'k_nearest_neighbours_k{k}_{num_electrodes}_electrodes.png')
+            suffix = f'_sample{n_samples}' if n_samples < n_sensors else ''
+            output_path = os.path.join(output_dir, 'images', f'k_nearest_neighbours_k{k}_{num_electrodes}_electrodes{suffix}.png')
             plt.savefig(output_path, dpi=300, bbox_inches='tight')
             print(f"Saved k-nearest neighbors plot to: {output_path}")
             plt.close()
@@ -314,7 +389,7 @@ class EEGtoGraph:
         Create a sparse adjacency matrix based on k-nearest neighbors in Cartesian coordinates.
         
         Args:
-            coords_df: DataFrame with columns ['label', 'x', 'y']
+            coords_df: DataFrame with columns ['label', 'x', 'y'] or ['label', 'x', 'y', 'z']
             k: Number of nearest neighbors
             output_dir: Directory to save outputs
             save: Whether to save the adjacency matrix
@@ -662,7 +737,8 @@ class EEGtoGraph:
         save: bool = True, 
         plot_neighbors: bool = False,
         n_splits: int = 5,
-        test_fold: int = 0
+        test_fold: int = 0,
+        subject_filter: str = None
     ):
         """
         Create graph dataset using ALL epochs/matrices per subject with GroupKFold splitting.
@@ -688,6 +764,7 @@ class EEGtoGraph:
             plot_neighbors: Whether to plot k-nearest neighbors
             n_splits: Number of folds for GroupKFold
             test_fold: Which fold to use as test set (0 to n_splits-1)
+            subject_filter: Comma-separated list of subject IDs to process (e.g., "AA164,BB178,AL012")
             
         Returns:
             dataset_train, dataset_val, dataset_test as GraphAutoencoderDataset objects
@@ -713,6 +790,12 @@ class EEGtoGraph:
             if not subject_folder.startswith('sub-'):
                 continue
             subject_id = subject_folder.split('-')[1]
+            
+            # Apply subject filter if provided (comma-separated list of IDs)
+            if subject_filter is not None:
+                allowed_ids = [s.strip() for s in subject_filter.split(',')]
+                if subject_id not in allowed_ids:
+                    continue
             subject_path = os.path.join(data_path, subject_folder)
             
             for session_folder in sorted(os.listdir(subject_path)):
