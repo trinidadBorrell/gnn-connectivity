@@ -20,6 +20,7 @@ Validation set guides both hyperparameter selection and early stopping, but does
 """
 
 import argparse
+import gc
 import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
@@ -28,11 +29,58 @@ from datetime import datetime
 from model import GAE
 
 try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+
+try:
     import wandb
     WANDB_AVAILABLE = True
 except ImportError:
     WANDB_AVAILABLE = False
     print("wandb not installed. Install with: pip install wandb")
+
+
+def print_resource_usage(label=""):
+    """Print current GPU and CPU resource usage for debugging.
+    
+    Args:
+        label: String label to identify where in the code this is called
+    """
+    print(f"\n{'─'*60}")
+    print(f"📊 RESOURCE USAGE: {label}")
+    print(f"{'─'*60}")
+    
+    # GPU metrics
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            allocated = torch.cuda.memory_allocated(i) / 1024**3
+            reserved = torch.cuda.memory_reserved(i) / 1024**3
+            max_allocated = torch.cuda.max_memory_allocated(i) / 1024**3
+            total = torch.cuda.get_device_properties(i).total_memory / 1024**3
+            print(f"  GPU {i} ({torch.cuda.get_device_name(i)}):")
+            print(f"    Allocated: {allocated:.3f} GB")
+            print(f"    Reserved:  {reserved:.3f} GB")
+            print(f"    Max Alloc: {max_allocated:.3f} GB")
+            print(f"    Total:     {total:.1f} GB")
+            print(f"    Usage:     {100*allocated/total:.1f}%")
+    else:
+        print("  GPU: Not available (CUDA not detected)")
+    
+    # CPU/RAM metrics
+    if PSUTIL_AVAILABLE:
+        process = psutil.Process()
+        mem_info = process.memory_info()
+        cpu_percent = process.cpu_percent(interval=0.1)
+        print(f"  CPU:")
+        print(f"    Process CPU:  {cpu_percent:.1f}%")
+        print(f"    Process RAM:  {mem_info.rss / 1024**3:.3f} GB")
+        print(f"    System RAM:   {psutil.virtual_memory().percent:.1f}% used")
+    else:
+        print("  CPU: psutil not available (pip install psutil)")
+    
+    print(f"{'─'*60}\n")
 #import ray
 #from ray import tune
 #from ray.tune.schedulers import ASHAScheduler
@@ -61,26 +109,66 @@ plt.rcParams.update(
 plt.rcParams["text.latex.preamble"] = r"\usepackage[version=3]{mhchem}"
 
 
-def normalize_graph_features(graph_list):
-    """Normalize all graphs in a list to [-1, 1] range."""
+def compute_normalization_stats(graph_list):
+    """Compute normalization statistics from a list of graphs (train set only).
+    
+    Args:
+        graph_list: List of graphs to compute stats from (should be training set only)
+        
+    Returns:
+        x_min, x_max, x_range: Normalization parameters
+    """
     all_features = torch.cat([g.x for g in graph_list], dim=0)
     x_min = all_features.min()
     x_max = all_features.max()
     x_range = x_max - x_min
+    print(f"  Normalization stats computed from {len(graph_list)} graphs")
+    print(f"  x_min: {x_min:.6f}, x_max: {x_max:.6f}, x_range: {x_range:.6f}")
+    return x_min, x_max, x_range
+
+
+def apply_normalization(graph_list, x_min, x_max, x_range, inplace=True):
+    """Apply normalization to graphs using pre-computed stats.
     
-    normalized_graphs = []
-    for g in graph_list:
-        g_copy = g.clone()
-        if x_range > 0:
-            g_copy.x = 2 * (g.x - x_min) / x_range - 1
-        else:
-            g_copy.x = torch.zeros_like(g.x)
-        normalized_graphs.append(g_copy)
+    Args:
+        graph_list: List of graphs to normalize
+        x_min, x_max, x_range: Pre-computed normalization parameters (from train set)
+        inplace: If True, modify graphs in-place (saves memory). Default: True
+        
+    Returns:
+        List of normalized graphs (same objects if inplace=True)
+    """
+    if inplace:
+        for g in graph_list:
+            if x_range > 0:
+                g.x = 2 * (g.x - x_min) / x_range - 1
+            else:
+                g.x = torch.zeros_like(g.x)
+        return graph_list
+    else:
+        normalized_graphs = []
+        for g in graph_list:
+            g_copy = g.clone()
+            if x_range > 0:
+                g_copy.x = 2 * (g.x - x_min) / x_range - 1
+            else:
+                g_copy.x = torch.zeros_like(g.x)
+            normalized_graphs.append(g_copy)
+        return normalized_graphs
+
+
+def normalize_graph_features(graph_list):
+    """Normalize all graphs in a list to [-1, 1] range.
     
+    DEPRECATED: Use compute_normalization_stats + apply_normalization instead
+    to avoid data leakage. This function computes stats from all provided graphs.
+    """
+    x_min, x_max, x_range = compute_normalization_stats(graph_list)
+    normalized_graphs = apply_normalization(graph_list, x_min, x_max, x_range)
     return normalized_graphs, x_min, x_max, x_range
 
 
-def compute_mse_on_graphs(model, graph_list, device=None):
+def compute_mse_on_graphs(model, graph_list, device=None, batch_size=64):
     """Compute average MSE reconstruction error on a list of graphs."""
     from torch_geometric.loader import DataLoader as PyGDataLoader
     
@@ -92,11 +180,13 @@ def compute_mse_on_graphs(model, graph_list, device=None):
     total_loss = 0.0
     num_batches = 0
     
-    loader = PyGDataLoader(graph_list, batch_size=64, shuffle=False)
+    # Larger batch size for evaluation (no gradients = less memory)
+    loader = PyGDataLoader(graph_list, batch_size=batch_size, shuffle=False, 
+                           num_workers=2, pin_memory=True)
     
     with torch.no_grad():
         for batch in loader:
-            batch = batch.to(device)
+            batch = batch.to(device, non_blocking=True)  # Async transfer
             x_recon, _ = model(batch.x, batch.edge_index)
             loss = criterion(x_recon, batch.x)
             total_loss += loss.item()
@@ -105,10 +195,16 @@ def compute_mse_on_graphs(model, graph_list, device=None):
     return total_loss / num_batches if num_batches > 0 else 0.0
 
 
-def train_one_epoch(model, optimizer, criterion, graph_list, batch_size=64, device=None):
-    """Train model for one epoch with mini-batching."""
-    from torch_geometric.loader import DataLoader as PyGDataLoader
+def train_one_epoch(model, optimizer, criterion, loader, device=None):
+    """Train model for one epoch with mini-batching.
     
+    Args:
+        model: The model to train
+        optimizer: Optimizer
+        criterion: Loss function
+        loader: Pre-created PyG DataLoader (created once, reused every epoch)
+        device: Device to use
+    """
     if device is None:
         device = torch.device('cpu')
     
@@ -116,12 +212,9 @@ def train_one_epoch(model, optimizer, criterion, graph_list, batch_size=64, devi
     total_loss = 0.0
     num_batches = 0
     
-    # Use PyG DataLoader for efficient batching
-    loader = PyGDataLoader(graph_list, batch_size=batch_size, shuffle=True, num_workers=0)
-    
     for batch in loader:
-        batch = batch.to(device)
-        optimizer.zero_grad()
+        batch = batch.to(device, non_blocking=True)  # Async CPU->GPU transfer
+        optimizer.zero_grad(set_to_none=True)  # Faster than zero_grad()
         x_recon, _ = model(batch.x, batch.edge_index)
         loss = criterion(x_recon, batch.x)
         loss.backward()
@@ -193,8 +286,21 @@ class TrainGAE:
         # Plot loss history if available
         if loss_history is not None:
             fig, ax = plt.subplots(figsize=(10, 6))
-            ax.plot(loss_history, linewidth=2)
-            ax.set_title('Training Loss Over Epochs', fontsize=14, fontweight='bold')
+            
+            # Check if loss_history is a dict with train/val/test keys
+            if isinstance(loss_history, dict):
+                if 'train' in loss_history:
+                    ax.plot(loss_history['train'], linewidth=2, label='Train', color='blue')
+                if 'val' in loss_history:
+                    ax.plot(loss_history['val'], linewidth=2, label='Validation', color='orange')
+                if 'test' in loss_history:
+                    ax.plot(loss_history['test'], linewidth=2, label='Test', color='green', linestyle='--')
+                ax.legend(fontsize=12)
+            else:
+                # Backwards compatibility: single list
+                ax.plot(loss_history, linewidth=2, label='Train')
+            
+            ax.set_title('Loss Over Epochs (Overfitting Check)', fontsize=14, fontweight='bold')
             ax.set_xlabel('Epoch')
             ax.set_ylabel('Loss (MSE)')
             ax.grid(True, alpha=0.3)
@@ -316,10 +422,16 @@ class TrainGAE:
         print("Training Final Model on Train+Val")
         print(f"{'='*60}\n")
         
-        # Device setup
-        device = torch.device('cuda' if torch.cuda.is_available() else 
-                             'mps' if torch.backends.mps.is_available() else 'cpu')
-        print(f"Using device: {device}")
+        # Device setup - force GPU if available
+        if torch.cuda.is_available():
+            device = torch.device('cuda:0')   # Use first GPU
+            print(f"✓ CUDA available - using GPU: {torch.cuda.get_device_name(0)}")
+            print(f"  GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+        else:
+            device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
+            print(f"⚠ CUDA not available, using: {device}")
+     #   device = torch.device('cpu')
+        print(f"Final device: {device}")
         
         # Initialize wandb
         if use_wandb and WANDB_AVAILABLE:
@@ -335,9 +447,24 @@ class TrainGAE:
             print("wandb requested but not available. Continuing without wandb.")
             use_wandb = False
         
+        # Import PyG DataLoader once
+        from torch_geometric.loader import DataLoader as PyGDataLoader
+        
         # Combine train and val for final training
         combined_graphs = self.train_graphs + self.val_graphs
         batch_size = config.get('batch_size', 64)
+        
+        # Create DataLoader ONCE (not every epoch - major speedup)
+        # System says max 2 workers - respect that limit
+        num_workers = 2
+        train_loader = PyGDataLoader(
+            combined_graphs, 
+            batch_size=batch_size, 
+            shuffle=True, 
+            num_workers=num_workers,
+            pin_memory=True
+        )
+        print(f"DataLoader: {len(train_loader)} batches, {num_workers} workers, batch_size={batch_size}")
         
         # Get hidden_dims from config, or build from hidden_channels
         hidden_dims = config.get('hidden_dims', [64, 64, 32, 16])
@@ -364,19 +491,63 @@ class TrainGAE:
         
         criterion = torch.nn.MSELoss()
         
-        loss_history = []
-        best_loss = float('inf')
+        loss_history = {'train': [], 'val': []}
+        best_val_loss = float('inf')
+        best_model_state = None
+        best_epoch = 0
+        
+        # Compute validation loss every N epochs (balance speed vs monitoring)
+        eval_interval = max(1, config['n_epochs'] // 50)  # ~50 eval points
+        
+        # Setup checkpoint directory for best model
+        checkpoint_dir = os.path.join(output_dir, 'checkpoints')
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        
+        # Resource monitoring before training
+        print_resource_usage("BEFORE TRAINING (model loaded to device)")
+        
+        # Reset GPU memory stats for accurate tracking
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
         
         for epoch in range(config['n_epochs']):
-            train_loss = train_one_epoch(model, optimizer, criterion, combined_graphs, 
-                                         batch_size=batch_size, device=device)
-            loss_history.append(train_loss)
+            train_loss = train_one_epoch(model, optimizer, criterion, train_loader, device=device)
+            loss_history['train'].append(train_loss)
+            
+            # Compute val loss periodically (not every epoch for speed)
+            # NOTE: Test set is held out - only evaluated once at end with best model
+            if epoch % eval_interval == 0 or epoch == config['n_epochs'] - 1:
+                val_loss = compute_mse_on_graphs(model, self.val_graphs, device=device)
+                loss_history['val'].append(val_loss)
+                
+                # Track best model based on validation loss
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_epoch = epoch
+                    best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                    
+                    # Save best model checkpoint
+                    best_checkpoint_path = os.path.join(checkpoint_dir, 'best_model.pt')
+                    torch.save({
+                        'epoch': epoch,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict(),
+                        'train_loss': train_loss,
+                        'val_loss': val_loss,
+                        'best_val_loss': best_val_loss,
+                        'config': config
+                    }, best_checkpoint_path)
+                    print(f"  🏆 New best model saved (val_loss={val_loss:.6f}) at epoch {epoch}")
+            else:
+                # Interpolate for plotting (use last known value)
+                if loss_history['val']:
+                    loss_history['val'].append(loss_history['val'][-1])
+                else:
+                    loss_history['val'].append(train_loss)
             
             # Step scheduler
             scheduler.step(train_loss)
-            
-            if train_loss < best_loss:
-                best_loss = train_loss
             
             # Get current learning rate
             current_lr = optimizer.param_groups[0]['lr']
@@ -386,31 +557,58 @@ class TrainGAE:
                 wandb.log({
                     "epoch": epoch,
                     "train_loss": train_loss,
-                    "best_loss": best_loss,
+                    "val_loss": loss_history['val'][-1],
+                    "best_val_loss": best_val_loss,
                     "learning_rate": current_lr
                 })
             
             if epoch % 10 == 0:
-                print(f'Epoch {epoch:03d}, Loss: {train_loss:.6f}, LR: {current_lr:.6f}')
+                # Monitor GPU memory usage
+                if torch.cuda.is_available():
+                    gpu_memory = torch.cuda.memory_allocated(0) / 1024**3
+                    gpu_cached = torch.cuda.memory_reserved(0) / 1024**3
+                    print(f'Epoch {epoch:03d}, Train: {train_loss:.6f}, Val: {loss_history["val"][-1]:.6f}, Best Val: {best_val_loss:.6f}, LR: {current_lr:.6f}, GPU: {gpu_memory:.3f}GB/{gpu_cached:.3f}GB')
+                else:
+                    print(f'Epoch {epoch:03d}, Train: {train_loss:.6f}, Val: {loss_history["val"][-1]:.6f}, Best Val: {best_val_loss:.6f}, LR: {current_lr:.6f}')
+            
+            # Full resource dump at key epochs (first, middle, last)
+            if epoch == 0 or epoch == config['n_epochs'] // 2 or epoch == config['n_epochs'] - 1:
+                print_resource_usage(f"DURING TRAINING (epoch {epoch}/{config['n_epochs']})")
         
-        # Final evaluation on test set
+        # Resource monitoring after training loop
+        print_resource_usage("AFTER TRAINING LOOP (before final eval)")
+        
+        # Load best model for final evaluation on held-out test set
+        print(f"\n{'='*60}")
+        print(f"Loading best model from epoch {best_epoch} (val_loss={best_val_loss:.6f})")
+        print(f"{'='*60}")
+        model.load_state_dict(best_model_state)
+        model = model.to(device)
+        
+        # Final evaluation on held-out test set (only done once with best model)
         test_mse = compute_mse_on_graphs(model, self.test_graphs, device=device)
         
         print(f"\n{'='*60}")
-        print("Final Results")
+        print("Final Results (Best Model on Held-Out Test Set)")
         print(f"{'='*60}")
+        print(f"Best Epoch: {best_epoch}")
+        print(f"Best Val Loss: {best_val_loss:.6f}")
         print(f"Test MSE: {test_mse:.6f}")
-        print(f"Best Train Loss: {best_loss:.6f}")
         print(f"{'='*60}\n")
+        
+        # Add test loss to history for final point only
+        loss_history['test'] = [None] * (len(loss_history['train']) - 1) + [test_mse]
         
         # Log final metrics to wandb
         if use_wandb and WANDB_AVAILABLE:
             wandb.log({
                 "test_mse": test_mse,
-                "final_best_loss": best_loss
+                "best_val_loss": best_val_loss,
+                "best_epoch": best_epoch
             })
             wandb.summary["test_mse"] = test_mse
-            wandb.summary["best_train_loss"] = best_loss
+            wandb.summary["best_val_loss"] = best_val_loss
+            wandb.summary["best_epoch"] = best_epoch
         
         if save_results:
             self.save_model_and_visualizations(model, config, loss_history, output_dir, experiment_name)
@@ -445,8 +643,16 @@ class TrainGAE:
         """
         import json
         
-        if device is None:
-            device = next(model.parameters()).device
+        # Use CPU for latent space extraction to avoid GPU memory leak
+        # (PyTorch Geometric SAGEConv has memory issues with many sequential graphs)
+        cpu_device = torch.device('cpu')
+        original_device = next(model.parameters()).device
+        model = model.to(cpu_device)
+        print(f"Moving model to CPU for latent space extraction (avoids GPU memory leak)")
+        
+        # Free GPU memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         latent_dir = os.path.join(output_dir, 'latent_space')
         os.makedirs(latent_dir, exist_ok=True)
@@ -460,13 +666,19 @@ class TrainGAE:
         }
         
         for subset_name, graphs in subsets.items():
+            print(f"Processing {subset_name} set ({len(graphs)} graphs)...")
             latent_json = {"electrodes": None, "data": {}}
             latent_tensors = []
             
+            num_graphs = len(graphs)
+            
             with torch.no_grad():
-                for graph in graphs:
-                    graph_device = graph.to(device)
-                    z = model.encode(graph_device.x, graph_device.edge_index)
+                for i, graph in enumerate(graphs):
+                    if i % 5000 == 0:
+                        print(f"  Progress: {i}/{num_graphs} ({100*i/num_graphs:.1f}%)")
+                    
+                    # Encode on CPU (graph is already on CPU)
+                    z = model.encode(graph.x, graph.edge_index)
                     
                     # Get metadata from graph (stored during preprocessing)
                     subject_id = str(getattr(graph, 'subject_id', 'unknown'))
@@ -479,8 +691,8 @@ class TrainGAE:
                         latent_json["electrodes"] = electrode_labels
                     
                     # Store full node-level latent vectors (no aggregation)
-                    z_np = z.cpu().numpy().tolist()  # Shape: [n_nodes, latent_dim]
-                    latent_tensors.append(z.cpu())
+                    z_np = z.numpy().tolist()  # Shape: [n_nodes, latent_dim]
+                    latent_tensors.append(z.clone())
                     
                     # Build nested structure: subject -> session -> matrix
                     if subject_id not in latent_json["data"]:
@@ -489,6 +701,10 @@ class TrainGAE:
                         latent_json["data"][subject_id][session_num] = {}
                     
                     latent_json["data"][subject_id][session_num][matrix_idx] = z_np
+                    
+                    # Periodic garbage collection
+                    if i % 10000 == 0 and i > 0:
+                        gc.collect()
             
             # Save as JSON
             json_path = os.path.join(latent_dir, f'{subset_name}_latent_{experiment_name}.json')
@@ -501,6 +717,10 @@ class TrainGAE:
             torch.save(latent_tensors, pt_path)
         
         print(f"\nLatent space files saved to: {latent_dir}")
+        
+        # Move model back to original device
+        model = model.to(original_device)
+        print(f"Model moved back to {original_device}")
     
     def _create_subset_visualizations(self, model, config, output_dir, experiment_name, device=None):
         """Create GAE visualization for each subset (train, val, test)."""
@@ -645,6 +865,27 @@ def main():
     
     args = parser.parse_args()
 
+    # Initial resource check - critical for debugging GPU issues
+    print("\n" + "="*70)
+    print("INITIAL SYSTEM CHECK")
+    print("="*70)
+    print(f"PyTorch version: {torch.__version__}")
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"CUDA version: {torch.version.cuda}")
+        print(f"cuDNN version: {torch.backends.cudnn.version()}")
+        print(f"GPU count: {torch.cuda.device_count()}")
+        for i in range(torch.cuda.device_count()):
+            print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
+            props = torch.cuda.get_device_properties(i)
+            print(f"    Memory: {props.total_memory / 1024**3:.1f} GB")
+            print(f"    Compute: {props.major}.{props.minor}")
+    else:
+        print("⚠ NO GPU DETECTED - Check CUDA installation")
+        print(f"  CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')}")
+    
+    print_resource_usage("AT STARTUP (before data loading)")
+    
     # Load datasets
     print("\n" + "="*70)
     print("Loading datasets...")
@@ -658,18 +899,29 @@ def main():
     val_graphs = val_dataset.data
     test_graphs = test_dataset.data
     
+    # Free memory: delete dataset wrappers (graphs are now referenced directly)
+    del train_dataset, val_dataset, test_dataset
+    gc.collect()
+    
     print(f"Train graphs: {len(train_graphs)}")
     print(f"Val graphs:   {len(val_graphs)}")
     print(f"Test graphs:  {len(test_graphs)}")
+    print_resource_usage("AFTER LOADING (datasets deleted)")
     
-    # Normalize all graphs
-    all_graphs = train_graphs + val_graphs + test_graphs
-    normalized_all, x_min, x_max, x_range = normalize_graph_features(all_graphs)
+    # Normalize graphs using TRAIN-ONLY statistics (prevents data leakage)
+    # Using inplace=True to avoid cloning (saves ~50% memory)
+    print("\nComputing normalization stats from TRAIN set only (no data leakage):")
+    x_min, x_max, x_range = compute_normalization_stats(train_graphs)
     
-    train_graphs = normalized_all[:len(train_graphs)]
-    val_graphs = normalized_all[len(train_graphs):len(train_graphs)+len(val_graphs)]
-    test_graphs = normalized_all[len(train_graphs)+len(val_graphs):]
-    
+    print("Applying normalization IN-PLACE to all splits...")
+    apply_normalization(train_graphs, x_min, x_max, x_range, inplace=True)
+    apply_normalization(val_graphs, x_min, x_max, x_range, inplace=True)
+    apply_normalization(test_graphs, x_min, x_max, x_range, inplace=True)
+    print(f"  Normalized {len(train_graphs)} train, {len(val_graphs)} val, {len(test_graphs)} test graphs")
+    gc.collect()
+
+    print_resource_usage("AFTER NORMALIZATION (in-place, no copies)")
+
     # Get in_channels from first graph or use provided value
     data_in_channels = train_graphs[0].x.shape[1]
     in_channels = args.in_channels if args.in_channels != data_in_channels else data_in_channels

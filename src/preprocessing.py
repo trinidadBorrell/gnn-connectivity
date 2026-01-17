@@ -838,7 +838,7 @@ class EEGtoGraph:
                             feature_type=feature_type,
                             channels=channels,
                             path_pattern=path_pattern,
-                            save=save
+                            save=False
                         )
                     
                     # Create a graph for each matrix
