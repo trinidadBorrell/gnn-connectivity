@@ -57,7 +57,8 @@ from datetime import datetime
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from preprocessing import EEGtoGraph
-from train import TrainGAE, normalize_graph_features
+from train import TrainGAE, compute_normalization_stats, apply_normalization
+from model import GAE
 from data_loaders import verify_no_data_leakage, save_datasets
 
 
@@ -177,13 +178,14 @@ def run_training(args, dataset_train, dataset_val, dataset_test):
     print(f"Val graphs:   {len(val_graphs)}")
     print(f"Test graphs:  {len(test_graphs)}")
     
-    # Normalize all graphs
-    all_graphs = train_graphs + val_graphs + test_graphs
-    normalized_all, x_min, x_max, x_range = normalize_graph_features(all_graphs)
+    # Normalize using TRAIN-ONLY statistics (prevents data leakage)
+    print("\nComputing normalization stats from TRAIN set only (no data leakage):")
+    x_min, x_max, x_range = compute_normalization_stats(train_graphs)
     
-    train_graphs = normalized_all[:len(train_graphs)]
-    val_graphs = normalized_all[len(train_graphs):len(train_graphs)+len(val_graphs)]
-    test_graphs = normalized_all[len(train_graphs)+len(val_graphs):]
+    print("Applying normalization IN-PLACE to all splits...")
+    apply_normalization(train_graphs, x_min, x_max, x_range, inplace=True)
+    apply_normalization(val_graphs, x_min, x_max, x_range, inplace=True)
+    apply_normalization(test_graphs, x_min, x_max, x_range, inplace=True)
     
     # Get in_channels from data
     in_channels = train_graphs[0].x.shape[1]
@@ -230,6 +232,132 @@ def run_training(args, dataset_train, dataset_val, dataset_test):
     )
     
     return final_model, training_dir
+
+
+def run_inference(args, dataset_train, dataset_val, dataset_test):
+    """Run inference using a pre-trained checkpoint.
+    
+    Loads the model from checkpoint, evaluates on all sets, generates visualizations,
+    and saves latent spaces.
+    """
+    print("\n" + "="*70)
+    print("INFERENCE MODE")
+    print("="*70)
+    
+    # Load checkpoint
+    print(f"\nLoading checkpoint: {args.checkpoint}")
+    checkpoint = torch.load(args.checkpoint, weights_only=False)
+    config = checkpoint['config']
+    
+    print(f"Checkpoint info:")
+    print(f"  Epoch: {checkpoint.get('epoch', 'N/A')}")
+    print(f"  Val Loss: {checkpoint.get('val_loss', checkpoint.get('best_val_loss', 'N/A'))}")
+    print(f"  Config: {config}")
+    
+    # Extract underlying graph lists
+    train_graphs = dataset_train.data
+    val_graphs = dataset_val.data
+    test_graphs = dataset_test.data
+    
+    print(f"\nDatasets loaded:")
+    print(f"  Train graphs: {len(train_graphs)}")
+    print(f"  Val graphs:   {len(val_graphs)}")
+    print(f"  Test graphs:  {len(test_graphs)}")
+    
+    # Normalize using TRAIN-ONLY statistics (same as training)
+    print("\nComputing normalization stats from TRAIN set only:")
+    x_min, x_max, x_range = compute_normalization_stats(train_graphs)
+    
+    print("Applying normalization IN-PLACE to all splits...")
+    apply_normalization(train_graphs, x_min, x_max, x_range, inplace=True)
+    apply_normalization(val_graphs, x_min, x_max, x_range, inplace=True)
+    apply_normalization(test_graphs, x_min, x_max, x_range, inplace=True)
+    
+    # Device setup
+    if torch.cuda.is_available():
+        device = torch.device('cuda:0')
+        print(f"\n✓ CUDA available - using GPU: {torch.cuda.get_device_name(0)}")
+    else:
+        device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
+        print(f"\n⚠ CUDA not available, using: {device}")
+    
+    # Initialize model with config from checkpoint
+    hidden_dims = config.get('hidden_dims', [64, 64, 32, 16])
+    model = GAE(
+        config['in_channels'],
+        hidden_dims=hidden_dims,
+        latent_dim=config.get('latent_dim', 2),
+        dropout=config.get('dropout', 0.2)
+    )
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model = model.to(device)
+    model.eval()
+    
+    print(f"\nModel loaded: {config['in_channels']} -> {hidden_dims} -> {config.get('latent_dim', 2)}")
+    
+    # Compute MSE on all sets
+    from train import compute_mse_on_graphs
+    
+    print("\n" + "-"*50)
+    print("Evaluating model on all sets...")
+    print("-"*50)
+    
+    train_mse = compute_mse_on_graphs(model, train_graphs, device=device)
+    val_mse = compute_mse_on_graphs(model, val_graphs, device=device)
+    test_mse = compute_mse_on_graphs(model, test_graphs, device=device)
+    
+    print(f"\nReconstruction MSE:")
+    print(f"  Train: {train_mse:.6f}")
+    print(f"  Val:   {val_mse:.6f}")
+    print(f"  Test:  {test_mse:.6f}")
+    
+    # Create output directory
+    inference_dir = os.path.join(args.output_dir, 'inference')
+    os.makedirs(inference_dir, exist_ok=True)
+    
+    experiment_name = args.experiment_name or datetime.now().strftime("%Y%m%d_%H%M%S") + "_inference"
+    
+    # Create trainer object for saving utilities
+    in_channels = config['in_channels']
+    trainer = TrainGAE(train_graphs, val_graphs, test_graphs, in_channels)
+    
+    # Save latent spaces for all sets
+    print("\n" + "-"*50)
+    print("Saving latent space representations...")
+    print("-"*50)
+    trainer.save_latent_spaces(model, inference_dir, experiment_name, device)
+    
+    # Create visualizations
+    print("\n" + "-"*50)
+    print("Creating visualizations...")
+    print("-"*50)
+    trainer._create_subset_visualizations(model, config, inference_dir, experiment_name, device)
+    
+    # Save evaluation results
+    results = {
+        'checkpoint': args.checkpoint,
+        'epoch': checkpoint.get('epoch', 'N/A'),
+        'train_mse': train_mse,
+        'val_mse': val_mse,
+        'test_mse': test_mse,
+        'config': config,
+        'n_train_graphs': len(train_graphs),
+        'n_val_graphs': len(val_graphs),
+        'n_test_graphs': len(test_graphs),
+    }
+    
+    import json
+    results_path = os.path.join(inference_dir, f'evaluation_results_{experiment_name}.json')
+    with open(results_path, 'w') as f:
+        json.dump(results, f, indent=2, default=str)
+    print(f"\nEvaluation results saved to: {results_path}")
+    
+    print("\n" + "="*70)
+    print("INFERENCE COMPLETED")
+    print("="*70)
+    print(f"\nOutputs saved to: {inference_dir}")
+    
+    return inference_dir
 
 
 def main():
@@ -285,9 +413,9 @@ def main():
                         help='Latent dimension size')
     parser.add_argument('--dropout', type=float, default=0.2,
                         help='Dropout probability')
-    parser.add_argument('--batch_size', type=int, default=64,
-                        help='Batch size for training')
-    parser.add_argument('--n_epochs', type=int, default=200,
+    parser.add_argument('--batch_size', type=int, default=256,
+                        help='Batch size for training (larger = faster on GPU)')
+    parser.add_argument('--n_epochs', type=int, default=100,
                         help='Number of training epochs')
     parser.add_argument('--lr', type=float, default=0.001,
                         help='Learning rate')
@@ -310,13 +438,24 @@ def main():
     parser.add_argument('--skip_preprocessing', action='store_true',
                         help='Skip preprocessing (use existing datasets)')
     parser.add_argument('--datasets_dir', type=str, default=None,
-                        help='Path to existing datasets (required if --skip_preprocessing)')
+                        help='Path to existing datasets (required if --skip_preprocessing or --inference)')
+    
+    # Inference mode
+    parser.add_argument('--inference', action='store_true',
+                        help='Run inference only (requires --checkpoint and --datasets_dir)')
+    parser.add_argument('--checkpoint', type=str, default=None,
+                        help='Path to model checkpoint for inference (e.g., output/training/checkpoints/best_model.pt)')
     
     args = parser.parse_args()
     
     # Validate arguments
-    if not args.skip_preprocessing and args.main_path is None and args.matrix_dir is None:
-        parser.error("Either --main_path, --matrix_dir, or --skip_preprocessing is required")
+    if args.inference:
+        if args.checkpoint is None:
+            parser.error("--checkpoint required when using --inference")
+        if args.datasets_dir is None:
+            parser.error("--datasets_dir required when using --inference")
+    elif not args.skip_preprocessing and args.main_path is None and args.matrix_dir is None:
+        parser.error("Either --main_path, --matrix_dir, --skip_preprocessing, or --inference is required")
     
     if args.skip_preprocessing and args.datasets_dir is None:
         parser.error("--datasets_dir required when using --skip_preprocessing")
@@ -325,7 +464,11 @@ def main():
     print("GNN CONNECTIVITY PIPELINE")
     print("="*70)
     
-    if args.skip_preprocessing:
+    if args.inference:
+        print("Mode: INFERENCE (load checkpoint, evaluate, save latent spaces)")
+        print(f"Checkpoint: {args.checkpoint}")
+        print(f"Datasets: {args.datasets_dir}")
+    elif args.skip_preprocessing:
         print("Mode: Loading existing datasets")
         print(f"Datasets: {args.datasets_dir}")
     elif args.matrix_dir:
@@ -348,7 +491,7 @@ def main():
     print(f"Loaded {len(coords_df)} electrode coordinates (system: {args.coordinate_system})")
     
     # Run preprocessing or load existing datasets
-    if args.skip_preprocessing:
+    if args.inference or args.skip_preprocessing:
         print(f"\nLoading existing datasets from: {args.datasets_dir}")
         dataset_train = torch.load(os.path.join(args.datasets_dir, 'train_dataset.pt'), weights_only=False)
         dataset_val = torch.load(os.path.join(args.datasets_dir, 'val_dataset.pt'), weights_only=False)
@@ -360,15 +503,26 @@ def main():
     else:
         dataset_train, dataset_val, dataset_test, datasets_dir = run_preprocessing(args, coords_df)
     
-    # Run training
-    final_model, training_dir = run_training(args, dataset_train, dataset_val, dataset_test)
-    
-    print("\n" + "="*70)
-    print("PIPELINE COMPLETED SUCCESSFULLY!")
-    print("="*70)
-    print("\nOutputs saved to:")
-    print(f"  Datasets: {datasets_dir}")
-    print(f"  Models & plots: {training_dir}")
+    # Run inference or training
+    if args.inference:
+        inference_dir = run_inference(args, dataset_train, dataset_val, dataset_test)
+        
+        print("\n" + "="*70)
+        print("INFERENCE COMPLETED SUCCESSFULLY!")
+        print("="*70)
+        print("\nOutputs saved to:")
+        print(f"  Datasets: {datasets_dir}")
+        print(f"  Inference results: {inference_dir}")
+    else:
+        # Run training
+        final_model, training_dir = run_training(args, dataset_train, dataset_val, dataset_test)
+        
+        print("\n" + "="*70)
+        print("PIPELINE COMPLETED SUCCESSFULLY!")
+        print("="*70)
+        print("\nOutputs saved to:")
+        print(f"  Datasets: {datasets_dir}")
+        print(f"  Models & plots: {training_dir}")
     
     return 0
 
