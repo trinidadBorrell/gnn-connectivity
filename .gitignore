@@ -11,3 +11,8 @@ src/paper.txt
 CLAUDE.md
 misc/
 wsmi_res/
+.pytest_cache/
+.vscode/
+clustering_results/
+logs/
+tests/
