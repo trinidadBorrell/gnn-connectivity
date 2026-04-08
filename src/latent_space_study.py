@@ -76,14 +76,21 @@ class LatentSpaceStudy:
     def _load_latent_data(self):
         """Load latent space JSON files."""
         for subset in ['train', 'val', 'test']:
-            json_files = [f for f in os.listdir(self.latent_dir) 
-                         if f.startswith(f'{subset}_latent_') and f.endswith('.json')]
-            
-            if json_files:
-                json_path = os.path.join(self.latent_dir, json_files[0])
-                print(f"Loading {subset}: {json_files[0]}...")
-                with open(json_path, 'r') as f:
-                    self.latent_data[subset] = json.load(f)
+            json_files = sorted(
+                [f for f in os.listdir(self.latent_dir)
+                 if f.startswith(f'{subset}_latent_') and f.endswith('.json')],
+                reverse=True,  # newest filename first
+            )
+
+            for json_file in json_files:
+                json_path = os.path.join(self.latent_dir, json_file)
+                print(f"Loading {subset}: {json_file}...")
+                try:
+                    with open(json_path, 'r') as f:
+                        self.latent_data[subset] = json.load(f)
+                    break  # loaded successfully, skip older files
+                except json.JSONDecodeError as e:
+                    print(f"  Warning: {json_file} is corrupt ({e}), skipping.")
     
     def get_subject_diagnosis(self, subject_id, session_num=None):
         """Get diagnosis for a subject."""
@@ -94,7 +101,8 @@ class LatentSpaceStudy:
                 mask = mask & session_mask
         
         if mask.any():
-            return self.labels_df.loc[mask, 'diagnostic_crs_final'].iloc[0]
+            val = self.labels_df.loc[mask, 'diagnostic_crs_final'].iloc[0]
+            return 'Unknown' if pd.isna(val) else str(val)
         return 'Unknown'
     
     def _is_valid_diagnosis(self, diagnosis):
@@ -706,7 +714,7 @@ def main():
         default='/home/triniborrell/home/projects/gnn_connectivity/output/inference/latent_space',
         help='Directory containing latent space JSON files')
     parser.add_argument('--labels_csv', type=str,
-        default='/data/project/eeg_foundation/data/metadata/patient_labels_with_controls.csv',
+        default='/data/project/eeg_foundation/data/metadata/metadata_patient_labels.csv',
         help='Path to CSV with patient diagnoses')
     parser.add_argument('--output_dir', type=str, default=None,
         help='Output directory (default: latent_dir/analysis)')
