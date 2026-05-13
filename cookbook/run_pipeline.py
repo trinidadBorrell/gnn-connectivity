@@ -57,7 +57,13 @@ from datetime import datetime
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from preprocessing import EEGtoGraph
-from train import TrainGAE, compute_normalization_stats, apply_normalization
+from train import (
+    TrainGAE,
+    compute_normalization_stats,
+    apply_normalization,
+    run_ray_tune,
+    _build_hidden_dims,
+)
 from model import GAE
 from data_loaders import verify_no_data_leakage, save_datasets
 
@@ -65,39 +71,40 @@ from data_loaders import verify_no_data_leakage, save_datasets
 def load_electrode_coordinates(coordinates_file, channels=None, coordinate_system='1005'):
     """
     Load electrode coordinates from file.
-    
+
     Args:
         coordinates_file: Path to file with electrode labels (and optionally coordinates)
         channels: Optional list of specific channels to use
-        coordinate_system: One of '1020', '1010', '1005' to use standard systems via get_elec_coords,
-                          or 'file' to read coordinates directly from the coordinates_file
-                          (expects format: label x y z per line)
-        
+        coordinate_system: One of '1020', '1010', '1005' to use standard systems via
+                          get_elec_coords, or 'file' to read coordinates directly from
+                          coordinates_file (expects format: label x y z per line).
+                          Fiducial rows starting with "Fid" are dropped if present.
+
     Returns:
-        coords_df: DataFrame with electrode coordinates
+        coords_df: DataFrame with columns ['label', 'x', 'y'] (z dropped if present)
     """
     import numpy as np
     import pandas as pd
-    
+
     if coordinate_system == 'file':
-        # Read coordinates directly from file (format: label x y z)
-        data = np.loadtxt(coordinates_file, dtype=str)
-        coords_df = pd.DataFrame({
-            'label': data[:, 0],
-            'x': data[:, 1].astype(float),
-            'y': data[:, 2].astype(float),
-            'z': data[:, 3].astype(float)
-        })
+        # Read coordinates directly from file (format: label x y z).
+        # pd.read_csv is more robust than np.loadtxt(dtype=str) for mixed type rows.
+        coords_df = pd.read_csv(
+            coordinates_file, sep=r"\s+", header=None,
+            names=["label", "x", "y", "z"], usecols=[0, 1, 2, 3]
+        )
+        # Defense: drop fiducial rows if file still contains them
+        coords_df = coords_df[~coords_df['label'].str.startswith('Fid')].reset_index(drop=True)
     else:
-        # Use standard electrode positioning system
+        # Use standard electrode positioning system (10-05 catalog lookup)
         from eeg_positions import get_elec_coords
         labels = np.loadtxt(coordinates_file, usecols=(0,), dtype=str)
         coords_data = get_elec_coords(system=coordinate_system, as_mne_montage=False)
         coords_df = coords_data[coords_data['label'].isin(labels)].copy()
-    
+
     if channels is not None:
         coords_df = coords_df[coords_df['label'].isin(channels)].copy()
-    
+
     return coords_df
 
 
@@ -207,8 +214,32 @@ def run_training(args, dataset_train, dataset_val, dataset_test):
         'n_epochs': args.n_epochs,
         'lr': args.lr,
         'weight_decay': args.weight_decay,
+        'variational': args.variational,
+        'beta': args.beta,
+        'kl_warmup_epochs': args.kl_warmup_epochs,
+        'patience': args.patience,
     }
-    
+
+    if args.tuning:
+        print("\n" + "="*70)
+        print("Running Ray Tune hyperparameter search")
+        print("="*70)
+        best_config = run_ray_tune(
+            train_graphs, val_graphs, in_channels,
+            num_samples=args.num_samples,
+            variational=args.variational,
+            n_epochs=args.tune_epochs,
+            kl_warmup_epochs=args.kl_warmup_epochs,
+            grace_period=args.tune_grace_period,
+        )
+        # Merge searchable fields into config; preserve fixed ones (n_epochs, batch_size, etc.)
+        for key in ('latent_dim', 'lr', 'num_layers', 'dropout'):
+            if key in best_config:
+                config[key] = best_config[key]
+        # Rebuild hidden_dims from best num_layers if not user-supplied
+        if 'num_layers' in best_config:
+            config['hidden_dims'] = _build_hidden_dims(best_config['num_layers'])
+
     print("\nTraining configuration:")
     for key, value in config.items():
         print(f"  {key}: {value}")
@@ -421,6 +452,26 @@ def main():
                         help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-5,
                         help='Weight decay for Adam optimizer')
+
+    # Variational (VGAE) options
+    parser.add_argument('--variational', action='store_true',
+                        help='Use VGAE (variational) instead of deterministic GAE')
+    parser.add_argument('--beta', type=float, default=1.0,
+                        help='Max weight on KL term for VGAE (after warm-up)')
+    parser.add_argument('--kl_warmup_epochs', type=int, default=50,
+                        help='Number of epochs to linearly ramp beta from 0 to --beta (VGAE only)')
+    parser.add_argument('--patience', type=int, default=None,
+                        help='Early stopping patience on val MSE (default: disabled)')
+
+    # Hyperparameter tuning (Ray Tune)
+    parser.add_argument('--tuning', action='store_true',
+                        help='Run Ray Tune hyperparameter search before final training')
+    parser.add_argument('--num_samples', type=int, default=10,
+                        help='Number of Ray Tune trials (default: 10)')
+    parser.add_argument('--tune_epochs', type=int, default=150,
+                        help='Max epochs per Ray Tune trial (default: 150)')
+    parser.add_argument('--tune_grace_period', type=int, default=20,
+                        help='ASHA grace period — min epochs before a trial can be pruned (default: 20)')
     
     # Output options
     parser.add_argument('--output_dir', type=str, default='output',

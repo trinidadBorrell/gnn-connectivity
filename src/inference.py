@@ -23,7 +23,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os
 from datetime import datetime
-from model import GAE
+from model import GAE, VGAE
 from preprocessing import EEGtoGraph
 
 # Plotting style parameters
@@ -67,45 +67,37 @@ class InferenceGAE:
         # Load model checkpoint
         checkpoint = torch.load(model_path, weights_only=False)
         
-        # Extract config - handle both old and new checkpoint formats
-        if 'config' in checkpoint:
-            config = checkpoint['config']
-            self.in_channels = config['in_channels']
-            self.hidden_channels = config['hidden_channels']
-            self.latent_dim = config['latent_dim']
-            self.num_layers = config.get('num_layers', 4)
-            self.dropout = config.get('dropout', 0.1)
-        else:
-            # Legacy format
-            self.in_channels = checkpoint.get('in_channels', data.x.shape[1])
-            self.hidden_channels = checkpoint.get('hidden_channels', 64)
-            self.latent_dim = checkpoint.get('latent_dim', 2)
-            self.num_layers = checkpoint.get('num_layers', 4)
-            self.dropout = checkpoint.get('dropout', 0.1)
-        
+        # Extract config from checkpoint
+        config = checkpoint.get('config', {})
+        self.in_channels = config.get('in_channels', data.x.shape[1])
+        self.hidden_dims = config.get('hidden_dims', [64, 64, 32, 16])
+        self.latent_dim = config.get('latent_dim', 2)
+        self.dropout = config.get('dropout', 0.2)
+        self.variational = config.get('variational', False)
+
         # Normalize input data to [-1, 1] (same as training)
         self.x_min = data.x.min()
         self.x_max = data.x.max()
         self.x_range = self.x_max - self.x_min
-        
+
         if self.x_range > 0:
             self.data.x = 2 * (data.x - self.x_min) / self.x_range - 1
         else:
             self.data.x = torch.zeros_like(data.x)
-        
-        # Initialize and load model
-        self.model = GAE(
+
+        ModelCls = VGAE if self.variational else GAE
+        self.model = ModelCls(
             self.in_channels,
-            self.hidden_channels,
-            self.latent_dim,
-            self.num_layers,
-            self.dropout
+            hidden_dims=self.hidden_dims,
+            latent_dim=self.latent_dim,
+            dropout=self.dropout,
         )
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.model.eval()
-        
+
         print(f"Model loaded from: {model_path}")
-        print(f"Architecture: in={self.in_channels}, hidden={self.hidden_channels}, latent={self.latent_dim}, layers={self.num_layers}, dropout={self.dropout}")
+        print(f"Architecture: {'VGAE' if self.variational else 'GAE'}, in={self.in_channels}, "
+              f"hidden_dims={self.hidden_dims}, latent={self.latent_dim}, dropout={self.dropout}")
     
     def denormalize(self, x_normalized):
         """Convert from [-1, 1] back to original scale"""
@@ -134,7 +126,8 @@ class InferenceGAE:
         
         # Run forward pass
         with torch.no_grad():
-            x_reconstructed, z = self.model(self.data.x, self.data.edge_index)
+            _out = self.model(self.data.x, self.data.edge_index)
+            x_reconstructed, z = _out[0], _out[1]
         
         # Calculate metrics in normalized space
         mse_norm = F.mse_loss(x_reconstructed, self.data.x).item()
@@ -180,7 +173,8 @@ class InferenceGAE:
         
         # Generate predictions
         with torch.no_grad():
-            x_reconstructed, z = self.model(self.data.x, self.data.edge_index)
+            _out = self.model(self.data.x, self.data.edge_index)
+            x_reconstructed, z = _out[0], _out[1]
             
             # Calculate reconstruction error in normalized space
             error_normalized = torch.abs(self.data.x - x_reconstructed)
@@ -347,21 +341,27 @@ def main():
     
     args = parser.parse_args()
     
-    # Load coordinates
+    # Load coordinates — auto-detect format (biosemi label-theta-phi vs GSN label-x-y-z)
     try:
-        from eeg_positions import get_elec_coords
-        
-        # Load labels from file
-        labels = np.loadtxt(args.coordinates_file, usecols=(0,), dtype=str)
-        
-        # Get electrode coordinates
-        coords_data = get_elec_coords(system='1005', as_mne_montage=False)
-        
-        # Filter to only include biosemi64 electrodes
-        coords_df = coords_data[coords_data['label'].isin(labels)].copy()
-        
+        import pandas as pd
+        with open(args.coordinates_file) as f:
+            first_line = f.readline().split()
+        n_cols = len(first_line)
+
+        if n_cols >= 4:
+            coords_df = pd.read_csv(
+                args.coordinates_file, sep=r"\s+", header=None,
+                names=["label", "x", "y", "z"], usecols=[0, 1, 2, 3]
+            )
+            coords_df = coords_df[~coords_df['label'].str.startswith('Fid')].reset_index(drop=True)
+        else:
+            from eeg_positions import get_elec_coords
+            labels = np.loadtxt(args.coordinates_file, usecols=(0,), dtype=str)
+            coords_data = get_elec_coords(system='1005', as_mne_montage=False)
+            coords_df = coords_data[coords_data['label'].isin(labels)].copy()
+
         print(f"Loaded {len(coords_df)} electrode coordinates")
-        
+
     except Exception as e:
         print(f"\nERROR loading coordinates: {str(e)}")
         import traceback

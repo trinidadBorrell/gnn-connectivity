@@ -1011,21 +1011,27 @@ def main():
     
     args = parser.parse_args()
     
-    # Load coordinates
+    # Load coordinates — auto-detect format (biosemi label-theta-phi vs GSN label-x-y-z)
     try:
-        from eeg_positions import get_elec_coords
-        
-        # Load labels from file
-        labels = np.loadtxt(args.coordinates_file, usecols=(0,), dtype=str)
-        
-        # Get electrode coordinates
-        coords_data = get_elec_coords(system='1005', as_mne_montage=False)
-        
-        # Filter to only include specified electrodes
-        coords_df = coords_data[coords_data['label'].isin(labels)].copy()
-        
+        with open(args.coordinates_file) as f:
+            first_line = f.readline().split()
+        n_cols = len(first_line)
+
+        if n_cols >= 4:
+            # GSN/HydroCel-style: label x y z
+            coords_df = pd.read_csv(
+                args.coordinates_file, sep=r"\s+", header=None,
+                names=["label", "x", "y", "z"], usecols=[0, 1, 2, 3]
+            )
+            coords_df = coords_df[~coords_df['label'].str.startswith('Fid')].reset_index(drop=True)
+        else:
+            from eeg_positions import get_elec_coords
+            labels = np.loadtxt(args.coordinates_file, usecols=(0,), dtype=str)
+            coords_data = get_elec_coords(system='1005', as_mne_montage=False)
+            coords_df = coords_data[coords_data['label'].isin(labels)].copy()
+
         print(f"Loaded {len(coords_df)} electrode coordinates")
-        
+
     except Exception as e:
         print(f"\nERROR loading coordinates: {str(e)}")
         import traceback

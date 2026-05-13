@@ -117,6 +117,58 @@ class GAE(torch.nn.Module):
         return x_reconstructed, z
 
 
+class VGAE(GAE):
+    """
+    Variational Graph Autoencoder.
+
+    Final encoder layer produces (mu, log_var) of size latent_dim each.
+    At training time, samples z via reparameterization: z = mu + eps * exp(0.5 * log_var).
+    At eval time, z = mu (deterministic).
+
+    Decoder and earlier encoder layers are identical to GAE.
+
+    forward returns (x_recon, z, mu, log_var).
+    """
+    def __init__(self, in_channels, hidden_dims=None, latent_dim=2, dropout=0.2):
+        super().__init__(in_channels, hidden_dims=hidden_dims, latent_dim=latent_dim, dropout=dropout)
+
+        # Replace the final encoder SAGEConv with one that outputs 2 * latent_dim
+        hidden_dims_used = self.hidden_dims
+        self.encoder_layers[-1] = SAGEConv(hidden_dims_used[-1], 2 * latent_dim, aggr='mean', project=True)
+
+        print(f"VGAE Architecture: {in_channels} -> {hidden_dims_used} -> 2*{latent_dim} (mu,logvar) -> {latent_dim} -> {list(reversed(hidden_dims_used))} -> {in_channels}")
+
+    def encode(self, x, edge_index):
+        # Run through all encoder layers except the final one (with activations)
+        for conv, norm, drop in zip(self.encoder_layers[:-1], self.encoder_norms, self.encoder_dropouts):
+            x = conv(x, edge_index)
+            x = norm(x)
+            x = F.leaky_relu(x, negative_slope=0.1)
+            x = drop(x)
+        # Final layer produces concatenated [mu | log_var]
+        out = self.encoder_layers[-1](x, edge_index)
+        mu, log_var = out.chunk(2, dim=-1)
+        return mu, log_var
+
+    def reparameterize(self, mu, log_var):
+        if self.training:
+            std = torch.exp(0.5 * log_var)
+            eps = torch.randn_like(std)
+            return mu + eps * std
+        return mu
+
+    def forward(self, x, edge_index):
+        mu, log_var = self.encode(x, edge_index)
+        z = self.reparameterize(mu, log_var)
+        x_reconstructed = self.decode(z, edge_index)
+        return x_reconstructed, z, mu, log_var
+
+
+def kl_divergence(mu, log_var):
+    """Standard KL(q(z|x) || N(0, I)) per-sample, averaged."""
+    return -0.5 * torch.mean(1 + log_var - mu.pow(2) - log_var.exp())
+
+
 class GAESimple(torch.nn.Module):
     """
     Original simple Graph Autoencoder with 2 layers.

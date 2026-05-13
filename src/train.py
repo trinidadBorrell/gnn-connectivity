@@ -26,7 +26,7 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import os
 from datetime import datetime
-from model import GAE
+from model import GAE, VGAE, kl_divergence
 
 try:
     import psutil
@@ -168,84 +168,197 @@ def normalize_graph_features(graph_list):
     return normalized_graphs, x_min, x_max, x_range
 
 
-def compute_mse_on_graphs(model, graph_list, device=None, batch_size=64):
-    """Compute average MSE reconstruction error on a list of graphs."""
+def compute_mse_on_graphs(model, graph_list, device=None, batch_size=64, variational=False):
+    """Compute average MSE reconstruction error on a list of graphs.
+
+    For variational models, uses mu deterministically (model.eval() also disables
+    reparameterization sampling inside VGAE). The `variational` flag is kept for
+    API symmetry — model.eval() already does the right thing.
+    """
     from torch_geometric.loader import DataLoader as PyGDataLoader
-    
+
     if device is None:
         device = torch.device('cpu')
-    
+
     model.eval()
     criterion = torch.nn.MSELoss()
     total_loss = 0.0
     num_batches = 0
-    
+
     # Larger batch size for evaluation (no gradients = less memory)
-    loader = PyGDataLoader(graph_list, batch_size=batch_size, shuffle=False, 
+    loader = PyGDataLoader(graph_list, batch_size=batch_size, shuffle=False,
                            num_workers=2, pin_memory=True)
-    
+
     with torch.no_grad():
         for batch in loader:
-            batch = batch.to(device, non_blocking=True)  # Async transfer
-            x_recon, _ = model(batch.x, batch.edge_index)
+            batch = batch.to(device, non_blocking=True)
+            out = model(batch.x, batch.edge_index)
+            x_recon = out[0]
             loss = criterion(x_recon, batch.x)
             total_loss += loss.item()
             num_batches += 1
-    
+
     return total_loss / num_batches if num_batches > 0 else 0.0
 
 
-def train_one_epoch(model, optimizer, criterion, loader, device=None):
-    """Train model for one epoch with mini-batching.
-    
+def train_one_epoch(model, optimizer, criterion, loader, device=None,
+                    variational=False, beta=0.0):
+    """Train model for one epoch using a pre-built PyG DataLoader.
+
     Args:
-        model: The model to train
+        model: The model to train (GAE or VGAE)
         optimizer: Optimizer
-        criterion: Loss function
+        criterion: Loss function (reconstruction)
         loader: Pre-created PyG DataLoader (created once, reused every epoch)
         device: Device to use
+        variational: If True, expect model to return (x_recon, z, mu, log_var) and
+                    add `beta * KL(q(z|x) || N(0,I))` to the loss.
+        beta: Weight on the KL term (typically ramped via KL warm-up).
+
+    Returns:
+        (avg_total_loss, avg_recon_loss, avg_kl).  avg_kl is 0.0 for non-variational.
     """
     if device is None:
         device = torch.device('cpu')
-    
+
     model.train()
     total_loss = 0.0
+    total_recon = 0.0
+    total_kl = 0.0
     num_batches = 0
-    
+
     for batch in loader:
-        batch = batch.to(device, non_blocking=True)  # Async CPU->GPU transfer
-        optimizer.zero_grad(set_to_none=True)  # Faster than zero_grad()
-        x_recon, _ = model(batch.x, batch.edge_index)
-        loss = criterion(x_recon, batch.x)
+        batch = batch.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        out = model(batch.x, batch.edge_index)
+        x_recon = out[0]
+        recon_loss = criterion(x_recon, batch.x)
+
+        if variational:
+            mu, log_var = out[2], out[3]
+            kl = kl_divergence(mu, log_var)
+            loss = recon_loss + beta * kl
+            total_kl += kl.item()
+        else:
+            loss = recon_loss
+
         loss.backward()
         optimizer.step()
         total_loss += loss.item()
+        total_recon += recon_loss.item()
         num_batches += 1
-    
-    return total_loss / num_batches if num_batches > 0 else 0.0
+
+    if num_batches == 0:
+        return 0.0, 0.0, 0.0
+    return total_loss / num_batches, total_recon / num_batches, total_kl / num_batches
+
+
+def _build_hidden_dims(num_layers):
+    """Derive hidden_dims list from num_layers using a geometric template."""
+    template = [64, 64, 32, 16]
+    if num_layers <= len(template):
+        return template[:num_layers]
+    return template + [16] * (num_layers - len(template))
 
 
 def ray_trainable(config, train_graphs=None, val_graphs=None):
-    """Ray Tune trainable function. Trains on train_graphs, reports val MSE."""
-    from ray.air import session
-    
+    """Ray Tune trainable: train one config, report val MSE each epoch."""
+    from ray import tune as ray_tune
+
     in_channels = config['in_channels']
-    hidden_channels = config['hidden_channels']
     latent_dim = config['latent_dim']
     num_layers = config.get('num_layers', 4)
     dropout = config.get('dropout', 0.1)
     lr = config['lr']
-    n_epochs = config['n_epochs']
-    
-    model = GAE(in_channels, hidden_channels, latent_dim, num_layers, dropout)
+    n_epochs = config.get('n_epochs', 150)
+    variational = config.get('variational', False)
+    beta_max = config.get('beta', 1.0)
+    kl_warmup_epochs = config.get('kl_warmup_epochs', 50)
+
+    hidden_dims = config.get('hidden_dims') or _build_hidden_dims(num_layers)
+
+    ModelCls = VGAE if variational else GAE
+    model = ModelCls(in_channels, hidden_dims=hidden_dims, latent_dim=latent_dim, dropout=dropout)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     criterion = torch.nn.MSELoss()
-    
+
     for epoch in range(n_epochs):
-        train_loss = train_one_epoch(model, optimizer, criterion, train_graphs)
-        val_mse = compute_mse_on_graphs(model, val_graphs)
-        
-        session.report({"val_mse": val_mse, "train_loss": train_loss, "epoch": epoch})
+        if variational:
+            beta = beta_max * min(1.0, epoch / max(1, kl_warmup_epochs))
+        else:
+            beta = 0.0
+
+        total_loss, recon_loss, kl_loss = train_one_epoch(
+            model, optimizer, criterion, train_graphs,
+            variational=variational, beta=beta,
+        )
+        val_mse = compute_mse_on_graphs(model, val_graphs, variational=variational)
+
+        ray_tune.report({
+            "val_mse": val_mse,
+            "train_loss": total_loss,
+            "recon_loss": recon_loss,
+            "kl_loss": kl_loss,
+            "beta": beta,
+            "epoch": epoch,
+        })
+
+
+def run_ray_tune(train_graphs, val_graphs, in_channels, num_samples=10,
+                 variational=False, n_epochs=150, kl_warmup_epochs=50,
+                 grace_period=20):
+    """Search latent_dim, lr, num_layers, dropout via ASHA. Returns best config dict."""
+    import ray
+    from ray import tune
+    from ray.tune.schedulers import ASHAScheduler
+
+    # Ray workers need src/ on PYTHONPATH to import this module
+    src_dir = os.path.dirname(os.path.abspath(__file__))
+    if not ray.is_initialized():
+        ray.init(
+            runtime_env={"env_vars": {"PYTHONPATH": src_dir}},
+            ignore_reinit_error=True,
+            log_to_driver=True,
+        )
+
+    search_space = {
+        'in_channels': in_channels,
+        'latent_dim': tune.choice([1, 2, 4, 8, 16]),
+        'lr': tune.loguniform(1e-4, 1e-2),
+        'num_layers': tune.choice([2, 3, 4]),
+        'dropout': tune.uniform(0.0, 0.4),
+        'n_epochs': n_epochs,
+        'variational': variational,
+        'kl_warmup_epochs': kl_warmup_epochs,
+        'beta': 1.0,
+    }
+
+    scheduler = ASHAScheduler(
+        time_attr="epoch",
+        max_t=n_epochs,
+        grace_period=grace_period,
+        reduction_factor=2,
+    )
+
+    trainable = tune.with_parameters(
+        ray_trainable, train_graphs=train_graphs, val_graphs=val_graphs
+    )
+
+    tuner = tune.Tuner(
+        tune.with_resources(trainable, resources={"cpu": 2}),
+        param_space=search_space,
+        tune_config=tune.TuneConfig(
+            metric="val_mse",
+            mode="min",
+            scheduler=scheduler,
+            num_samples=num_samples,
+        ),
+    )
+    results = tuner.fit()
+    best = results.get_best_result(metric="val_mse", mode="min")
+    print("\nBest config:", best.config)
+    print("Best val MSE:", best.metrics.get("val_mse"))
+    return best.config
 
 
 class TrainGAE:
@@ -342,7 +455,8 @@ class TrainGAE:
                 # Move graph to device
                 graph = graph.to(device)
                 # Forward pass
-                x_recon, z = model(graph.x, graph.edge_index)
+                _out = model(graph.x, graph.edge_index)
+                x_recon, z = _out[0], _out[1]
                 
                 # Calculate error in normalized space
                 error_normalized = torch.abs(graph.x - x_recon)
@@ -453,80 +567,93 @@ class TrainGAE:
         # Combine train and val for final training
         combined_graphs = self.train_graphs + self.val_graphs
         batch_size = config.get('batch_size', 64)
-        
-        # Create DataLoader ONCE (not every epoch - major speedup)
-        # System says max 2 workers - respect that limit
-        num_workers = 2
+
+        # Create DataLoader ONCE (not every epoch — major speedup)
+        num_workers = 2  # System says max 2 workers
         train_loader = PyGDataLoader(
-            combined_graphs, 
-            batch_size=batch_size, 
-            shuffle=True, 
+            combined_graphs,
+            batch_size=batch_size,
+            shuffle=True,
             num_workers=num_workers,
-            pin_memory=True
+            pin_memory=True,
         )
         print(f"DataLoader: {len(train_loader)} batches, {num_workers} workers, batch_size={batch_size}")
-        
-        # Get hidden_dims from config, or build from hidden_channels
+
+        # Variational config
+        variational = config.get('variational', False)
+        beta_max = config.get('beta', 1.0)
+        kl_warmup_epochs = config.get('kl_warmup_epochs', 50)
+        patience = config.get('patience', None)  # None = no early stopping
+
+        # Get hidden_dims from config
         hidden_dims = config.get('hidden_dims', [64, 64, 32, 16])
-        
-        model = GAE(
-            config['in_channels'], 
+
+        ModelCls = VGAE if variational else GAE
+        model = ModelCls(
+            config['in_channels'],
             hidden_dims=hidden_dims,
             latent_dim=config.get('latent_dim', 2),
             dropout=config.get('dropout', 0.2)
         )
         model = model.to(device)
-        
+
         # Optimizer with weight decay
         optimizer = torch.optim.Adam(
-            model.parameters(), 
+            model.parameters(),
             lr=config.get('lr', 0.001),
             weight_decay=config.get('weight_decay', 1e-5)
         )
-        
+
         # Learning rate scheduler - reduce on plateau
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode='min', factor=0.5, patience=20
         )
-        
+
         criterion = torch.nn.MSELoss()
-        
+
         loss_history = {'train': [], 'val': []}
         best_val_loss = float('inf')
         best_model_state = None
         best_epoch = 0
-        
+        epochs_since_improve = 0  # for patience-based early stopping
+
         # Compute validation loss every N epochs (balance speed vs monitoring)
         eval_interval = max(1, config['n_epochs'] // 50)  # ~50 eval points
-        
+
         # Setup checkpoint directory for best model
         checkpoint_dir = os.path.join(output_dir, 'checkpoints')
         os.makedirs(checkpoint_dir, exist_ok=True)
-        
-        # Resource monitoring before training
+
         print_resource_usage("BEFORE TRAINING (model loaded to device)")
-        
-        # Reset GPU memory stats for accurate tracking
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
-        
+
         for epoch in range(config['n_epochs']):
-            train_loss = train_one_epoch(model, optimizer, criterion, train_loader, device=device)
+            # KL warm-up: ramp beta linearly from 0 to beta_max over kl_warmup_epochs
+            if variational:
+                beta = beta_max * min(1.0, epoch / max(1, kl_warmup_epochs))
+            else:
+                beta = 0.0
+
+            train_loss, recon_loss, kl_loss = train_one_epoch(
+                model, optimizer, criterion, train_loader, device=device,
+                variational=variational, beta=beta,
+            )
             loss_history['train'].append(train_loss)
-            
-            # Compute val loss periodically (not every epoch for speed)
-            # NOTE: Test set is held out - only evaluated once at end with best model
-            if epoch % eval_interval == 0 or epoch == config['n_epochs'] - 1:
-                val_loss = compute_mse_on_graphs(model, self.val_graphs, device=device)
+
+            # Validation + best-model tracking on eval_interval (or final epoch)
+            evaluated_this_epoch = (epoch % eval_interval == 0) or (epoch == config['n_epochs'] - 1)
+            if evaluated_this_epoch:
+                val_loss = compute_mse_on_graphs(model, self.val_graphs, device=device,
+                                                 variational=variational)
                 loss_history['val'].append(val_loss)
-                
-                # Track best model based on validation loss
-                if val_loss < best_val_loss:
+
+                if val_loss < best_val_loss - 1e-6:
                     best_val_loss = val_loss
                     best_epoch = epoch
                     best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-                    
-                    # Save best model checkpoint
+                    epochs_since_improve = 0
+
                     best_checkpoint_path = os.path.join(checkpoint_dir, 'best_model.pt')
                     torch.save({
                         'epoch': epoch,
@@ -536,57 +663,76 @@ class TrainGAE:
                         'train_loss': train_loss,
                         'val_loss': val_loss,
                         'best_val_loss': best_val_loss,
-                        'config': config
+                        'config': config,
                     }, best_checkpoint_path)
                     print(f"  🏆 New best model saved (val_loss={val_loss:.6f}) at epoch {epoch}")
+                else:
+                    epochs_since_improve += 1
             else:
-                # Interpolate for plotting (use last known value)
+                # Interpolate val for plotting; reuse last known value
                 if loss_history['val']:
                     loss_history['val'].append(loss_history['val'][-1])
                 else:
                     loss_history['val'].append(train_loss)
-            
-            # Step scheduler
+
+            # Step scheduler on train loss
             scheduler.step(train_loss)
-            
-            # Get current learning rate
             current_lr = optimizer.param_groups[0]['lr']
-            
+
             # Log to wandb
             if use_wandb and WANDB_AVAILABLE:
-                wandb.log({
+                log_dict = {
                     "epoch": epoch,
                     "train_loss": train_loss,
+                    "recon_loss": recon_loss,
                     "val_loss": loss_history['val'][-1],
                     "best_val_loss": best_val_loss,
-                    "learning_rate": current_lr
-                })
-            
+                    "learning_rate": current_lr,
+                }
+                if variational:
+                    log_dict["kl_loss"] = kl_loss
+                    log_dict["beta"] = beta
+                wandb.log(log_dict)
+
             if epoch % 10 == 0:
-                # Monitor GPU memory usage
+                cur_val = loss_history['val'][-1]
+                gpu_str = ""
                 if torch.cuda.is_available():
                     gpu_memory = torch.cuda.memory_allocated(0) / 1024**3
                     gpu_cached = torch.cuda.memory_reserved(0) / 1024**3
-                    print(f'Epoch {epoch:03d}, Train: {train_loss:.6f}, Val: {loss_history["val"][-1]:.6f}, Best Val: {best_val_loss:.6f}, LR: {current_lr:.6f}, GPU: {gpu_memory:.3f}GB/{gpu_cached:.3f}GB')
-                else:
-                    print(f'Epoch {epoch:03d}, Train: {train_loss:.6f}, Val: {loss_history["val"][-1]:.6f}, Best Val: {best_val_loss:.6f}, LR: {current_lr:.6f}')
-            
-            # Full resource dump at key epochs (first, middle, last)
+                    gpu_str = f", GPU: {gpu_memory:.3f}GB/{gpu_cached:.3f}GB"
+                msg = (f'Epoch {epoch:03d}, Train: {train_loss:.6f}, Val: {cur_val:.6f}, '
+                       f'Best Val: {best_val_loss:.6f}, LR: {current_lr:.6f}{gpu_str}')
+                if variational:
+                    msg += f', Recon: {recon_loss:.6f}, KL: {kl_loss:.6f}, beta: {beta:.3f}'
+                print(msg)
+
+            # Full resource dump at key epochs
             if epoch == 0 or epoch == config['n_epochs'] // 2 or epoch == config['n_epochs'] - 1:
                 print_resource_usage(f"DURING TRAINING (epoch {epoch}/{config['n_epochs']})")
-        
-        # Resource monitoring after training loop
+
+            # Patience-based early stopping (counted in eval_intervals).
+            # Skip while KL is still warming up for VGAE — loss landscape unstable.
+            if patience is not None and evaluated_this_epoch and epochs_since_improve >= patience:
+                if variational and epoch < kl_warmup_epochs:
+                    continue
+                print(f"Early stopping at epoch {epoch} "
+                      f"(no val improvement for {patience} evaluations).")
+                break
+
         print_resource_usage("AFTER TRAINING LOOP (before final eval)")
-        
+
         # Load best model for final evaluation on held-out test set
         print(f"\n{'='*60}")
         print(f"Loading best model from epoch {best_epoch} (val_loss={best_val_loss:.6f})")
         print(f"{'='*60}")
-        model.load_state_dict(best_model_state)
-        model = model.to(device)
-        
+        if best_model_state is not None:
+            model.load_state_dict(best_model_state)
+            model = model.to(device)
+
         # Final evaluation on held-out test set (only done once with best model)
-        test_mse = compute_mse_on_graphs(model, self.test_graphs, device=device)
+        test_mse = compute_mse_on_graphs(model, self.test_graphs, device=device,
+                                         variational=variational)
         
         print(f"\n{'='*60}")
         print("Final Results (Best Model on Held-Out Test Set)")
@@ -672,14 +818,24 @@ class TrainGAE:
             
             num_graphs = len(graphs)
             
+            # Use whatever device the model actually ended up on
+            model_device = next(model.parameters()).device
+
             with torch.no_grad():
                 for i, graph in enumerate(graphs):
                     if i % 5000 == 0:
                         print(f"  Progress: {i}/{num_graphs} ({100*i/num_graphs:.1f}%)")
-                    
-                    # Encode on CPU (graph is already on CPU)
-                    z = model.encode(graph.x, graph.edge_index)
-                    
+
+                    # Encode using model's actual device.
+                    # For VGAE, encode returns (mu, log_var); save mu deterministically.
+                    # For GAE, encode returns z directly.
+                    x_dev = graph.x.to(model_device)
+                    ei_dev = graph.edge_index.to(model_device)
+                    enc_out = model.encode(x_dev, ei_dev)
+                    z = enc_out[0] if isinstance(enc_out, tuple) else enc_out
+                    z = z.cpu()
+
+
                     # Get metadata from graph (stored during preprocessing)
                     subject_id = str(getattr(graph, 'subject_id', 'unknown'))
                     session_num = str(getattr(graph, 'session_num', 'unknown'))
@@ -764,7 +920,8 @@ class TrainGAE:
         with torch.no_grad():
             for row_idx, graph in enumerate(sample_graphs):
                 graph = graph.to(device)
-                x_recon, z = model(graph.x, graph.edge_index)
+                _out = model(graph.x, graph.edge_index)
+                x_recon, z = _out[0], _out[1]
                 
                 # Get metadata
                 subject_id = getattr(graph, 'subject_id', 'unknown')

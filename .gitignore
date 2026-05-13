@@ -16,3 +16,4 @@ wsmi_res/
 clustering_results/
 logs/
 tests/
+output_old/
