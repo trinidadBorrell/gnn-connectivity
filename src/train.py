@@ -171,34 +171,31 @@ def normalize_graph_features(graph_list):
 def compute_mse_on_graphs(model, graph_list, device=None, batch_size=64, variational=False):
     """Compute average MSE reconstruction error on a list of graphs.
 
-    For variational models, uses mu deterministically (model.eval() also disables
-    reparameterization sampling inside VGAE). The `variational` flag is kept for
-    API symmetry — model.eval() already does the right thing.
+    Iterates one graph at a time and explicitly moves tensors to the target
+    device. This sidesteps two MPS-on-macOS issues that bite the PyG DataLoader:
+      1. `_share_filename_` fails when num_workers > 0 and any tensor is on MPS.
+      2. `torch.cat()` during batch collation fails if graphs have mixed
+         device state (e.g. after a prior training phase touched some of them).
+    For variational models, model.eval() already disables sampling.
     """
-    from torch_geometric.loader import DataLoader as PyGDataLoader
-
     if device is None:
         device = torch.device('cpu')
 
     model.eval()
     criterion = torch.nn.MSELoss()
     total_loss = 0.0
-    num_batches = 0
-
-    # Larger batch size for evaluation (no gradients = less memory)
-    loader = PyGDataLoader(graph_list, batch_size=batch_size, shuffle=False,
-                           num_workers=2, pin_memory=True)
+    n = 0
 
     with torch.no_grad():
-        for batch in loader:
-            batch = batch.to(device, non_blocking=True)
-            out = model(batch.x, batch.edge_index)
+        for g in graph_list:
+            x = g.x.to(device)
+            edge_index = g.edge_index.to(device)
+            out = model(x, edge_index)
             x_recon = out[0]
-            loss = criterion(x_recon, batch.x)
-            total_loss += loss.item()
-            num_batches += 1
+            total_loss += float(criterion(x_recon, x))
+            n += 1
 
-    return total_loss / num_batches if num_batches > 0 else 0.0
+    return total_loss / n if n > 0 else 0.0
 
 
 def train_one_epoch(model, optimizer, criterion, loader, device=None,
@@ -302,6 +299,120 @@ def ray_trainable(config, train_graphs=None, val_graphs=None):
             "beta": beta,
             "epoch": epoch,
         })
+
+
+def ray_trainable_wsmi(config, train_graphs=None, val_graphs=None):
+    """Ray Tune trainable for the wSMI pipeline.
+
+    Wider search space than ray_trainable: hidden_dims, batch_size,
+    weight_decay, KL warmup, and beta_kl are all tunable.
+    Uses a PyG DataLoader so trials respect the searched batch_size.
+    """
+    from ray import tune as ray_tune
+    from torch_geometric.loader import DataLoader as PyGDataLoader
+
+    in_channels = config["in_channels"]
+    latent_dim = config["latent_dim"]
+    hidden_dims = config["hidden_dims"]
+    dropout = config["dropout"]
+    lr = config["lr"]
+    weight_decay = config.get("weight_decay", 0.0)
+    batch_size = config.get("batch_size", 64)
+    n_epochs = config.get("n_epochs", 80)
+    variational = config.get("variational", False)
+    beta_max = config.get("beta_kl", 1.0)
+    kl_warmup_epochs = config.get("kl_warmup_epochs", 10)
+
+    ModelCls = VGAE if variational else GAE
+    model = ModelCls(in_channels, hidden_dims=hidden_dims,
+                     latent_dim=latent_dim, dropout=dropout)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=lr, weight_decay=weight_decay)
+    criterion = torch.nn.MSELoss()
+
+    loader = PyGDataLoader(train_graphs, batch_size=batch_size,
+                           shuffle=True, num_workers=0)
+
+    for epoch in range(n_epochs):
+        if variational:
+            beta = beta_max * min(1.0, epoch / max(1, kl_warmup_epochs))
+        else:
+            beta = 0.0
+        total_loss, recon_loss, kl_loss = train_one_epoch(
+            model, optimizer, criterion, loader,
+            variational=variational, beta=beta,
+        )
+        val_mse = compute_mse_on_graphs(model, val_graphs,
+                                        variational=variational)
+        ray_tune.report({
+            "val_mse": val_mse,
+            "train_loss": total_loss,
+            "recon_loss": recon_loss,
+            "kl_loss": kl_loss,
+            "beta": beta,
+            "epoch": epoch,
+        })
+
+
+def run_ray_tune_wsmi(train_graphs, val_graphs, in_channels,
+                      variational=False, num_samples=20, n_epochs=80,
+                      grace_period=10, cpus_per_trial=2,
+                      storage_path=None):
+    """Wider ASHA search for the wSMI pipeline. Returns best config dict + analysis dataframe."""
+    import ray
+    from ray import tune
+    from ray.tune.schedulers import ASHAScheduler
+
+    src_dir = os.path.dirname(os.path.abspath(__file__))
+    if not ray.is_initialized():
+        ray.init(
+            runtime_env={"env_vars": {"PYTHONPATH": src_dir}},
+            ignore_reinit_error=True,
+            log_to_driver=True,
+        )
+
+    HIDDEN_CHOICES = [[64, 32], [64, 64, 32], [64, 64, 32, 16]]
+    search_space = {
+        "in_channels": in_channels,
+        "latent_dim": tune.choice([2, 4, 8, 16, 32]),
+        "hidden_dims": tune.choice(HIDDEN_CHOICES),
+        "lr": tune.loguniform(1e-4, 5e-3),
+        "dropout": tune.uniform(0.0, 0.4),
+        "batch_size": tune.choice([32, 64]),
+        "weight_decay": tune.loguniform(1e-6, 1e-3),
+        "n_epochs": n_epochs,
+        "variational": variational,
+    }
+    if variational:
+        search_space["beta_kl"] = tune.choice([0.001, 0.01, 0.1, 1.0])
+        search_space["kl_warmup_epochs"] = tune.choice([0, 10, 30])
+
+    scheduler = ASHAScheduler(
+        time_attr="epoch", max_t=n_epochs,
+        grace_period=grace_period, reduction_factor=2,
+    )
+    trainable = tune.with_parameters(
+        ray_trainable_wsmi, train_graphs=train_graphs, val_graphs=val_graphs,
+    )
+    tune_config = tune.TuneConfig(
+        metric="val_mse", mode="min", scheduler=scheduler,
+        num_samples=num_samples,
+    )
+    run_config_kwargs = {"name": f"wsmi_{'vgae' if variational else 'gae'}_asha"}
+    if storage_path is not None:
+        run_config_kwargs["storage_path"] = os.path.abspath(storage_path)
+    tuner = tune.Tuner(
+        tune.with_resources(trainable, resources={"cpu": cpus_per_trial}),
+        param_space=search_space,
+        tune_config=tune_config,
+        run_config=tune.RunConfig(**run_config_kwargs),
+    )
+    results = tuner.fit()
+    best = results.get_best_result(metric="val_mse", mode="min")
+    df = results.get_dataframe()
+    print("\nBest config:", best.config)
+    print("Best val MSE:", best.metrics.get("val_mse"))
+    return best.config, df
 
 
 def run_ray_tune(train_graphs, val_graphs, in_channels, num_samples=10,
