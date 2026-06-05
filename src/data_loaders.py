@@ -248,6 +248,13 @@ def verify_no_data_leakage(train_dataset, val_dataset, test_dataset) -> bool:
         True if no data leakage, raises AssertionError otherwise
     """
     def get_subjects(dataset):
+        # Fast path: lazy on-disk dataset exposes a per-item subject id list
+        # without touching the actual data.
+        if hasattr(dataset, 'subject_ids'):
+            return set(dataset.subject_ids)
+        if hasattr(dataset, 'data') and hasattr(dataset.data, 'subject_ids'):
+            return set(dataset.data.subject_ids)
+        # Fallback: iterate and pull from each graph
         subjects = set()
         data = dataset.data if hasattr(dataset, 'data') else dataset
         for g in data:

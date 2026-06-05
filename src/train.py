@@ -110,14 +110,16 @@ plt.rcParams["text.latex.preamble"] = r"\usepackage[version=3]{mhchem}"
 
 
 def compute_normalization_stats(graph_list):
-    """Compute normalization statistics from a list of graphs (train set only).
-    
-    Args:
-        graph_list: List of graphs to compute stats from (should be training set only)
-        
-    Returns:
-        x_min, x_max, x_range: Normalization parameters
+    """Compute normalization statistics from a graph collection (train only).
+
+    Polymorphic: if `graph_list` is a lazy on-disk dataset (exposes
+    `compute_train_stats`), uses its streaming mmap-based pass. Otherwise
+    falls back to the in-memory `torch.cat` approach.
     """
+    if hasattr(graph_list, 'compute_train_stats'):
+        x_min, x_max, x_range = graph_list.compute_train_stats()
+        return x_min, x_max, x_range
+
     all_features = torch.cat([g.x for g in graph_list], dim=0)
     x_min = all_features.min()
     x_max = all_features.max()
@@ -128,16 +130,21 @@ def compute_normalization_stats(graph_list):
 
 
 def apply_normalization(graph_list, x_min, x_max, x_range, inplace=True):
-    """Apply normalization to graphs using pre-computed stats.
-    
-    Args:
-        graph_list: List of graphs to normalize
-        x_min, x_max, x_range: Pre-computed normalization parameters (from train set)
-        inplace: If True, modify graphs in-place (saves memory). Default: True
-        
-    Returns:
-        List of normalized graphs (same objects if inplace=True)
+    """Apply normalization to a graph collection using pre-computed stats.
+
+    Polymorphic: if `graph_list` is a lazy on-disk dataset (exposes
+    `set_normalization`), stashes the stats so __getitem__ applies them on the
+    fly. Subset views (e.g. train/val/test slices of the same underlying
+    on-disk dataset) propagate to the parent automatically.
     """
+    if hasattr(graph_list, 'set_normalization'):
+        graph_list.set_normalization(float(x_min), float(x_max), float(x_range))
+        return graph_list
+    # Subset-of-on-disk: set on parent
+    if hasattr(graph_list, 'parent') and hasattr(graph_list.parent, 'set_normalization'):
+        graph_list.parent.set_normalization(float(x_min), float(x_max), float(x_range))
+        return graph_list
+
     if inplace:
         for g in graph_list:
             if x_range > 0:
@@ -262,8 +269,14 @@ def _build_hidden_dims(num_layers):
 
 
 def ray_trainable(config, train_graphs=None, val_graphs=None):
-    """Ray Tune trainable: train one config, report val MSE each epoch."""
+    """Ray Tune trainable: train one config, report val MSE each epoch.
+
+    Supports per-trial early stopping via `config['patience']`. ASHA still does
+    cross-trial pruning on top; the patience stop just keeps a trial from
+    burning compute after its own val plateaus.
+    """
     from ray import tune as ray_tune
+    from torch_geometric.loader import DataLoader as PyGDataLoader
 
     in_channels = config['in_channels']
     latent_dim = config['latent_dim']
@@ -274,14 +287,28 @@ def ray_trainable(config, train_graphs=None, val_graphs=None):
     variational = config.get('variational', False)
     beta_max = config.get('beta', 1.0)
     kl_warmup_epochs = config.get('kl_warmup_epochs', 50)
+    batch_size = config.get('batch_size', 64)
+    weight_decay = config.get('weight_decay', 1e-5)
+    patience = config.get('patience', None)  # None disables per-trial early stop
 
     hidden_dims = config.get('hidden_dims') or _build_hidden_dims(num_layers)
 
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
     ModelCls = VGAE if variational else GAE
-    model = ModelCls(in_channels, hidden_dims=hidden_dims, latent_dim=latent_dim, dropout=dropout)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    model = ModelCls(in_channels, hidden_dims=hidden_dims, latent_dim=latent_dim,
+                     dropout=dropout).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     criterion = torch.nn.MSELoss()
 
+    # Build the loader ONCE per trial (significant speedup vs every epoch).
+    train_loader = PyGDataLoader(
+        train_graphs, batch_size=batch_size, shuffle=True,
+        num_workers=0, pin_memory=(device.type == 'cuda'),
+    )
+
+    best_val = float('inf')
+    epochs_since_improve = 0
     for epoch in range(n_epochs):
         if variational:
             beta = beta_max * min(1.0, epoch / max(1, kl_warmup_epochs))
@@ -289,13 +316,21 @@ def ray_trainable(config, train_graphs=None, val_graphs=None):
             beta = 0.0
 
         total_loss, recon_loss, kl_loss = train_one_epoch(
-            model, optimizer, criterion, train_graphs,
+            model, optimizer, criterion, train_loader, device=device,
             variational=variational, beta=beta,
         )
-        val_mse = compute_mse_on_graphs(model, val_graphs, variational=variational)
+        val_mse = compute_mse_on_graphs(model, val_graphs, device=device,
+                                        variational=variational)
+
+        if val_mse < best_val - 1e-6:
+            best_val = val_mse
+            epochs_since_improve = 0
+        else:
+            epochs_since_improve += 1
 
         ray_tune.report({
             "val_mse": val_mse,
+            "best_val_mse": best_val,
             "train_loss": total_loss,
             "recon_loss": recon_loss,
             "kl_loss": kl_loss,
@@ -303,11 +338,20 @@ def ray_trainable(config, train_graphs=None, val_graphs=None):
             "epoch": epoch,
         })
 
+        if patience is not None and epochs_since_improve >= patience:
+            break
+
 
 def run_ray_tune(train_graphs, val_graphs, in_channels, num_samples=10,
                  variational=False, n_epochs=150, kl_warmup_epochs=50,
-                 grace_period=20):
-    """Search latent_dim, lr, num_layers, dropout via ASHA. Returns best config dict."""
+                 grace_period=20, batch_size=64, weight_decay=1e-5,
+                 cpus_per_trial=2, gpus_per_trial=None,
+                 patience_choices=(None, 15, 30)):
+    """Search hyperparameters via ASHA. Returns the best config dict.
+
+    Search space: latent_dim, lr, num_layers, dropout, and `patience` (per-trial
+    early stop window — `None` means run to n_epochs).
+    """
     import ray
     from ray import tune
     from ray.tune.schedulers import ASHAScheduler
@@ -321,16 +365,24 @@ def run_ray_tune(train_graphs, val_graphs, in_channels, num_samples=10,
             log_to_driver=True,
         )
 
+    # Auto-assign one GPU per trial if available and not explicitly disabled.
+    if gpus_per_trial is None:
+        gpus_per_trial = 1 if torch.cuda.is_available() else 0
+
     search_space = {
         'in_channels': in_channels,
         'latent_dim': tune.choice([1, 2, 4, 8, 16]),
         'lr': tune.loguniform(1e-4, 1e-2),
         'num_layers': tune.choice([2, 3, 4]),
         'dropout': tune.uniform(0.0, 0.4),
+        'patience': tune.choice(list(patience_choices)),
+        # Fixed across trials (could be promoted to tunable later)
         'n_epochs': n_epochs,
         'variational': variational,
         'kl_warmup_epochs': kl_warmup_epochs,
         'beta': 1.0,
+        'batch_size': batch_size,
+        'weight_decay': weight_decay,
     }
 
     scheduler = ASHAScheduler(
@@ -344,8 +396,12 @@ def run_ray_tune(train_graphs, val_graphs, in_channels, num_samples=10,
         ray_trainable, train_graphs=train_graphs, val_graphs=val_graphs
     )
 
+    resources = {"cpu": cpus_per_trial}
+    if gpus_per_trial:
+        resources["gpu"] = gpus_per_trial
+
     tuner = tune.Tuner(
-        tune.with_resources(trainable, resources={"cpu": 2}),
+        tune.with_resources(trainable, resources=resources),
         param_space=search_space,
         tune_config=tune.TuneConfig(
             metric="val_mse",
@@ -563,9 +619,11 @@ class TrainGAE:
         
         # Import PyG DataLoader once
         from torch_geometric.loader import DataLoader as PyGDataLoader
-        
-        # Combine train and val for final training
-        combined_graphs = self.train_graphs + self.val_graphs
+        from torch.utils.data import ConcatDataset
+
+        # Combine train and val for final training. ConcatDataset works for
+        # both plain lists of Data objects and the lazy on-disk dataset.
+        combined_graphs = ConcatDataset([self.train_graphs, self.val_graphs])
         batch_size = config.get('batch_size', 64)
 
         # Create DataLoader ONCE (not every epoch — major speedup)

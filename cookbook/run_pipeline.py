@@ -141,10 +141,14 @@ def run_preprocessing(args, coords_df):
     if args.subject_filter:
         print(f"Subject filter: {args.subject_filter.split(',')} (only processing listed subjects)")
     
+    # If the user supplied --matrix_dir, ignore the default --main_path
+    # (which is otherwise non-None and trips create_graph_dataset's mutual-exclusion check).
+    effective_main_path = None if args.matrix_dir else args.main_path
+
     # Create graph dataset
     dataset_train, dataset_val, dataset_test = EEGtoGraph.create_graph_dataset(
         coords_df=coords_df,
-        main_path=args.main_path,
+        main_path=effective_main_path,
         matrix_dir=args.matrix_dir,
         window_points=args.window_points,
         k=args.k,
@@ -233,7 +237,7 @@ def run_training(args, dataset_train, dataset_val, dataset_test):
             grace_period=args.tune_grace_period,
         )
         # Merge searchable fields into config; preserve fixed ones (n_epochs, batch_size, etc.)
-        for key in ('latent_dim', 'lr', 'num_layers', 'dropout'):
+        for key in ('latent_dim', 'lr', 'num_layers', 'dropout', 'patience'):
             if key in best_config:
                 config[key] = best_config[key]
         # Rebuild hidden_dims from best num_layers if not user-supplied

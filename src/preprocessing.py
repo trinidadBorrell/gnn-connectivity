@@ -25,6 +25,7 @@ from typing import Dict, List, Tuple
 import scipy.sparse as sp
 import matplotlib.pyplot as plt
 import os
+import glob
 import pandas as pd
 
 # Plotting style parameters
@@ -106,56 +107,143 @@ class EEGtoGraph:
         return epochs.get_data()  # (n_epochs, n_channels, n_times)
     
     @staticmethod
-    def load_precomputed_matrices(matrix_dir: str, subject_id: str, session_num: str,
-                                   n_nodes: int = None, path_pattern: str = None) -> List[np.ndarray]:
+    def enumerate_matrix_sessions(matrix_dir: str):
+        """Enumerate (subject_id, session_num, source) triples under matrix_dir.
+
+        Layout-agnostic: recursively finds any directory matching
+        `<anything>/sub-{ID}/ses-{NUM}/` that contains either a .npz file or
+        per-epoch matrix_*.npy files. This handles, without modification:
+          (A) flat per-epoch  : {matrix_dir}/sub-X/ses-Y/matrix_*.npy
+          (B) flat per-session: {matrix_dir}/sub-X/ses-Y/<anything>.npz
+          (C) drive-chunked   : {matrix_dir}/<chunk>/<inner>/sub-X/ses-Y/*.npz
+          (D) cohort-split    : {matrix_dir}/<chunk>/<inner>/{wsmi_res_DOC,wsmi_res_control}/sub-X/ses-Y/*.npz
+        Duplicate (subject_id, session_num) pairs across chunks are deduped
+        (first match wins).
+
+        `source` is one of:
+          {'kind': 'npz', 'path': <npz file>, 'cohort': <str or None>}
+          {'kind': 'npy_dir', 'path': <ses dir>, 'cohort': <str or None>}
+        Per-session .npz takes precedence over per-epoch .npy if both exist.
         """
-        Load pre-computed feature matrices from a folder.
-        
+        sessions = []
+        seen = set()  # dedupe (subject_id, session_num) across chunked copies
+        # Recursive walk: yield every directory named ses-* under matrix_dir.
+        # os.walk is faster than glob('**') on large trees and avoids
+        # symlink loops by default.
+        for dirpath, dirnames, filenames in os.walk(matrix_dir, followlinks=False):
+            base = os.path.basename(dirpath)
+            if not base.startswith('ses-'):
+                continue
+            parent = os.path.basename(os.path.dirname(dirpath))
+            if not parent.startswith('sub-'):
+                continue
+            subject_id = parent.split('-', 1)[1]
+            session_num = base.split('-', 1)[1]
+            key = (subject_id, session_num)
+            if key in seen:
+                continue
+
+            # Detect cohort from the path (looks for wsmi_res_{DOC,control})
+            cohort = None
+            for part in dirpath.split(os.sep):
+                if part.startswith('wsmi_res_') and part != 'wsmi_res_':
+                    cohort = part[len('wsmi_res_'):]
+                    break
+
+            npzs = sorted(f for f in filenames if f.endswith('.npz'))
+            npys = sorted(f for f in filenames if f.startswith('matrix_') and f.endswith('.npy'))
+            if npzs:
+                if len(npzs) > 1:
+                    print(f"WARNING: multiple .npz in {dirpath}; using {npzs[0]}")
+                source = {'kind': 'npz', 'path': os.path.join(dirpath, npzs[0]),
+                          'cohort': cohort}
+            elif npys:
+                source = {'kind': 'npy_dir', 'path': dirpath, 'cohort': cohort}
+            else:
+                continue
+            seen.add(key)
+            sessions.append((subject_id, session_num, source))
+
+        # Sort deterministically (subject_id, then session_num)
+        sessions.sort(key=lambda t: (t[0], t[1]))
+        return sessions
+
+    @staticmethod
+    def load_precomputed_matrices(matrix_dir: str = None, subject_id: str = None,
+                                   session_num: str = None, n_nodes: int = None,
+                                   path_pattern: str = None,
+                                   source: dict = None,
+                                   npz_key: str = 'data') -> List[np.ndarray]:
+        """
+        Load pre-computed feature matrices for one (subject, session).
+
+        Preferred call: pass `source` from `enumerate_matrix_sessions`. The legacy
+        signature (matrix_dir, subject_id, session_num, path_pattern) is kept for
+        backward compatibility with per-epoch `.npy` files.
+
         Args:
-            matrix_dir: Base directory containing the matrices
-            subject_id: Subject ID
-            session_num: Session number
-            n_nodes: Expected number of nodes (for validation). If None, no validation.
-            path_pattern: Custom path pattern. If None, uses DEFAULT_MATRIX_PATH_PATTERN.
-                         Available placeholders: {matrix_dir}, {subject_id}, {session_num}, {matrix_idx}
-            
+            matrix_dir, subject_id, session_num: legacy locator for per-epoch .npy mode
+            n_nodes: Expected number of nodes (validation). None = no check.
+            path_pattern: Custom .npy path pattern (default DEFAULT_MATRIX_PATH_PATTERN).
+            source: dict returned by enumerate_matrix_sessions; supersedes the legacy args.
+            npz_key: which key inside an .npz file holds the (n_epochs, n, n) tensor.
+
         Returns:
-            List of feature matrices (each n_nodes x n_features)
+            List of feature matrices (each n_nodes x n_nodes for connectivity).
         """
+        # --- npz-per-session path ----------------------------------------------
+        if source is not None and source.get('kind') == 'npz':
+            with np.load(source['path'], allow_pickle=False) as d:
+                if npz_key not in d:
+                    raise KeyError(f"{source['path']} missing key '{npz_key}'. Keys: {list(d.keys())}")
+                arr = d[npz_key]  # (n_epochs, n, n)
+            if arr.ndim != 3:
+                raise ValueError(f"Expected 3D array in {source['path']}, got shape {arr.shape}")
+            if n_nodes is not None and arr.shape[1] != n_nodes:
+                raise ValueError(
+                    f"{source['path']} has {arr.shape[1]} nodes, expected {n_nodes} (adjacency mismatch)"
+                )
+            # Convert to a list of 2D matrices; cast to float32 to keep downstream consistent
+            return [arr[i].astype(np.float32, copy=False) for i in range(arr.shape[0])]
+
+        # --- npy-per-epoch path (legacy) ---------------------------------------
         if path_pattern is None:
             path_pattern = DEFAULT_MATRIX_PATH_PATTERN
-        
+
+        # If we got a source dict for npy_dir mode, use its base path as matrix_dir-like.
+        if source is not None and source.get('kind') == 'npy_dir':
+            ses_dir = source['path']
+            # Override pattern to point at this ses_dir directly: matrix_{idx}.npy under it
+            iter_pattern = os.path.join(ses_dir, 'matrix_{matrix_idx}.npy')
+            fmt = lambda i: iter_pattern.format(matrix_idx=i)
+        else:
+            if matrix_dir is None or subject_id is None or session_num is None:
+                raise ValueError("load_precomputed_matrices needs either `source` or "
+                                 "(matrix_dir, subject_id, session_num).")
+            fmt = lambda i: path_pattern.format(
+                matrix_dir=matrix_dir, subject_id=subject_id,
+                session_num=session_num, matrix_idx=i,
+            )
+
         matrices = []
         matrix_idx = 0
-        
         while True:
-            matrix_path = path_pattern.format(
-                matrix_dir=matrix_dir,
-                subject_id=subject_id,
-                session_num=session_num,
-                matrix_idx=matrix_idx
-            )
-            
+            matrix_path = fmt(matrix_idx)
             if not os.path.exists(matrix_path):
                 break
-            
             matrix = np.load(matrix_path)
-            
-            # Validate node count if specified
             if n_nodes is not None and matrix.shape[0] != n_nodes:
                 raise ValueError(
                     f"Matrix at {matrix_path} has {matrix.shape[0]} nodes, "
                     f"expected {n_nodes} to match adjacency matrix"
                 )
-            
             matrices.append(matrix)
             matrix_idx += 1
-        
+
         if len(matrices) == 0:
             raise FileNotFoundError(
                 f"No matrices found for sub-{subject_id}/ses-{session_num} in {matrix_dir}"
             )
-        
         return matrices
 
     @staticmethod
@@ -777,116 +865,173 @@ class EEGtoGraph:
         
         use_precomputed = matrix_dir is not None
         data_path = matrix_dir if use_precomputed else main_path
-        
+
         dataset = []
         subject_ids = []  # Track subject ID for each graph (for GroupKFold)
-        
+
         # First, create adjacency matrix (shared across all graphs)
         adjacency = None
         labels = None
         n_nodes = len(coords_df)
-        
-        for subject_folder in sorted(os.listdir(data_path)):
-            if not subject_folder.startswith('sub-'):
-                continue
-            subject_id = subject_folder.split('-')[1]
-            
-            # Apply subject filter if provided (comma-separated list of IDs)
-            if subject_filter is not None:
-                allowed_ids = [s.strip() for s in subject_filter.split(',')]
-                if subject_id not in allowed_ids:
+
+        allowed_ids = None
+        if subject_filter is not None:
+            allowed_ids = {s.strip() for s in subject_filter.split(',')}
+
+        # Build the (subject, session, source) work list. For matrix mode we
+        # delegate to enumerate_matrix_sessions so we transparently handle:
+        #   - flat per-epoch .npy directories
+        #   - flat per-session .npz files
+        #   - chunked Google-Drive-style wsmi_res-*/wsmi_res/sub-X/ses-Y/*.npz
+        if use_precomputed:
+            session_specs = EEGtoGraph.enumerate_matrix_sessions(matrix_dir)
+            if not session_specs:
+                raise ValueError(f"No (subject, session) folders found under {matrix_dir}")
+        else:
+            # EEG mode: discover (sub, ses) via the legacy listdir walk
+            session_specs = []
+            for subject_folder in sorted(os.listdir(data_path)):
+                if not subject_folder.startswith('sub-'):
                     continue
-            subject_path = os.path.join(data_path, subject_folder)
-            
-            for session_folder in sorted(os.listdir(subject_path)):
-                if not session_folder.startswith('ses-'):
-                    continue
-                session_num = session_folder.split('-')[1]
-                session_path = os.path.join(subject_path, session_folder)
-                
-                # For EEG mode, check if eeg folder exists
-                if not use_precomputed:
-                    eeg_path = os.path.join(session_path, 'eeg')
-                    if not os.path.exists(eeg_path):
+                sid = subject_folder.split('-')[1]
+                subject_path = os.path.join(data_path, subject_folder)
+                for session_folder in sorted(os.listdir(subject_path)):
+                    if not session_folder.startswith('ses-'):
                         continue
-                
-                # Create adjacency matrix once (same for all graphs)
-                if adjacency is None:
-                    adjacency, labels, _ = EEGtoGraph.adjacency_matrix(
-                        coords_df, k, output_dir, save, plot_neighbors
+                    snum = session_folder.split('-')[1]
+                    session_path = os.path.join(subject_path, session_folder)
+                    if not os.path.exists(os.path.join(session_path, 'eeg')):
+                        continue
+                    session_specs.append((sid, snum, None))
+
+        # Apply subject filter to session_specs up front (simplifies branching)
+        if allowed_ids is not None:
+            session_specs = [s for s in session_specs if s[0] in allowed_ids]
+            if not session_specs:
+                raise ValueError(f"No sessions matched subject_filter={subject_filter}")
+
+        # Build adjacency once (shared across all graphs)
+        adjacency, labels, _ = EEGtoGraph.adjacency_matrix(
+            coords_df, k, output_dir, save, plot_neighbors
+        )
+        electrode_labels = list(coords_df['label'].values)
+
+        # --- Lazy on-disk path: matrix mode with all-npz sources -----------
+        # Avoids materializing all per-epoch graphs in RAM (which is the
+        # ~25 GB OOM trap on the full 164-session dataset).
+        all_npz = (
+            use_precomputed
+            and len(session_specs) > 0
+            and all(spec[2] is not None and spec[2].get('kind') == 'npz'
+                    for spec in session_specs)
+        )
+        if all_npz:
+            from lazy_dataset import WsmiOnDiskDataset
+
+            sessions_meta = [
+                {'subject_id': sid, 'session_num': snum,
+                 'npz_path': source['path'],
+                 'cohort': source.get('cohort')}
+                for sid, snum, source in session_specs
+            ]
+
+            cache_dir = os.path.join(output_dir, 'wsmi_npy_cache')
+            print(f"\nMaterializing mmap-friendly .npy caches under {cache_dir}")
+            print(f"  ({len(sessions_meta)} sessions; one-time decompression "
+                  f"if caches don't already exist)")
+
+            a_coo = adjacency.tocoo()
+            edge_index = torch.tensor(np.array([a_coo.row, a_coo.col]), dtype=torch.long)
+
+            full = WsmiOnDiskDataset(
+                sessions=sessions_meta,
+                edge_index=edge_index,
+                electrode_labels=electrode_labels,
+                cache_dir=cache_dir,
+                n_nodes=n_nodes,
+            )
+
+            n_total = len(full)
+            print(f"\nTotal graphs (lazy): {n_total}")
+            print(f"Unique subjects: {len({s['subject_id'] for s in full.sessions})}")
+
+            subject_ids_arr = np.array(full.subject_ids)
+            group_kfold = GroupKFold(n_splits=n_splits)
+            folds = list(group_kfold.split(np.arange(n_total), groups=subject_ids_arr))
+            test_idx = folds[test_fold][1]
+            val_fold = (test_fold + 1) % n_splits
+            val_idx = folds[val_fold][1]
+            train_idx = np.concatenate(
+                [folds[i][1] for i in range(n_splits) if i != test_fold and i != val_fold]
+            )
+
+            dataset_train = full.subset(train_idx)
+            dataset_val = full.subset(val_idx)
+            dataset_test = full.subset(test_idx)
+
+            print(f"Train graphs: {len(dataset_train)} (subjects: {len(set(subject_ids_arr[train_idx]))})")
+            print(f"Val graphs: {len(dataset_val)} (subjects: {len(set(subject_ids_arr[val_idx]))})")
+            print(f"Test graphs: {len(dataset_test)} (subjects: {len(set(subject_ids_arr[test_idx]))})")
+            return dataset_train, dataset_val, dataset_test
+
+        # --- Legacy in-memory path: EEG mode, or per-epoch .npy mode -------
+        for subject_id, session_num, source in session_specs:
+            try:
+                if use_precomputed:
+                    feature_matrices = EEGtoGraph.load_precomputed_matrices(
+                        source=source,
+                        n_nodes=n_nodes,
+                        path_pattern=matrix_path_pattern,
                     )
-                
-                # Get all feature matrices for this subject/session
-                try:
-                    if use_precomputed:
-                        # Load pre-computed matrices
-                        feature_matrices = EEGtoGraph.load_precomputed_matrices(
-                            matrix_dir=matrix_dir,
-                            subject_id=subject_id,
-                            session_num=session_num,
-                            n_nodes=n_nodes,
-                            path_pattern=matrix_path_pattern
-                        )
-                    else:
-                        # Compute from EEG data
-                        feature_matrices = EEGtoGraph.feature_matrix_all_epochs(
-                            main_path=main_path,
-                            subject_id=subject_id,
-                            session_num=session_num,
-                            output_dir=output_dir,
-                            window_points=window_points,
-                            feature_type=feature_type,
-                            channels=channels,
-                            path_pattern=path_pattern,
-                            save=False
-                        )
-                    
-                    # Create a graph for each matrix
-                    for matrix_idx, feature_mat in enumerate(feature_matrices):
-                        data = EEGtoGraph.create_torch_geometric_data(feature_mat, adjacency)
-                        # Store metadata for later use
-                        data.subject_id = subject_id
-                        data.session_num = session_num
-                        data.matrix_idx = matrix_idx
-                        data.electrode_labels = list(coords_df['label'].values)
-                        dataset.append(data)
-                        subject_ids.append(subject_id)
-                        
-                except Exception as e:
-                    print(f"Warning: Could not process sub-{subject_id}/ses-{session_num}: {e}")
-                    continue
-        
+                else:
+                    feature_matrices = EEGtoGraph.feature_matrix_all_epochs(
+                        main_path=main_path,
+                        subject_id=subject_id,
+                        session_num=session_num,
+                        output_dir=output_dir,
+                        window_points=window_points,
+                        feature_type=feature_type,
+                        channels=channels,
+                        path_pattern=path_pattern,
+                        save=False
+                    )
+
+                for matrix_idx, feature_mat in enumerate(feature_matrices):
+                    data = EEGtoGraph.create_torch_geometric_data(feature_mat, adjacency)
+                    data.subject_id = subject_id
+                    data.session_num = session_num
+                    data.matrix_idx = matrix_idx
+                    data.electrode_labels = electrode_labels
+                    dataset.append(data)
+                    subject_ids.append(subject_id)
+
+            except Exception as e:
+                print(f"Warning: Could not process sub-{subject_id}/ses-{session_num}: {e}")
+                continue
+
         print(f"\nTotal graphs created: {len(dataset)}")
         print(f"Unique subjects: {len(set(subject_ids))}")
-        
+
         if len(dataset) == 0:
             raise ValueError("No graphs were created. Check your data paths.")
-        
-        # Use GroupKFold to split by subject (no data leakage)
-        # Keep as list to avoid Data object conversion issues
+
         subject_ids_np = np.array(subject_ids)
         group_kfold = GroupKFold(n_splits=n_splits)
-        
-        # Get all fold indices
         folds = list(group_kfold.split(dataset, groups=subject_ids_np))
-        
-        # Use test_fold as test, next fold as val, rest as train
+
         test_idx = folds[test_fold][1]
         val_fold = (test_fold + 1) % n_splits
         val_idx = folds[val_fold][1]
-        
-        # Train is everything else
         train_idx = np.concatenate([folds[i][1] for i in range(n_splits) if i != test_fold and i != val_fold])
-        
-        # Extract datasets directly from list
+
         dataset_train = [dataset[i] for i in train_idx]
         dataset_val = [dataset[i] for i in val_idx]
         dataset_test = [dataset[i] for i in test_idx]
-        
+
         print(f"Train graphs: {len(dataset_train)} (subjects: {len(set(subject_ids_np[train_idx]))})")
         print(f"Val graphs: {len(dataset_val)} (subjects: {len(set(subject_ids_np[val_idx]))})")
         print(f"Test graphs: {len(dataset_test)} (subjects: {len(set(subject_ids_np[test_idx]))})")
-        
+
         dataset_train = GraphAutoencoderDataset(dataset_train)
         dataset_val = GraphAutoencoderDataset(dataset_val)
         dataset_test = GraphAutoencoderDataset(dataset_test)
