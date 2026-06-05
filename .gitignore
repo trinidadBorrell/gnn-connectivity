@@ -17,5 +17,4 @@ clustering_results/
 logs/
 tests/
 output_old/
-docs/lab-notebook/
 slurm/logs/
