@@ -55,6 +55,43 @@ DIAG_GROUP_COLORS = {
     "MCS": "#ff7f0e",
 }
 
+# Preferred clinical ordering (coarse + fine labels), most-impaired -> recovered.
+PREFERRED_GROUP_ORDER = ["CONTROL", "COMA", "UWS", "MCS-", "MCS", "MCS+", "EMCS"]
+# Fixed hues for known labels; unknown labels get a tab10 colour at resolve time.
+KNOWN_GROUP_COLORS = {
+    "CONTROL": "#2ca02c",  # green
+    "COMA": "#7f7f7f",     # grey
+    "UWS": "#d62728",      # red
+    "MCS-": "#ff9896",     # light orange/red
+    "MCS": "#ff7f0e",      # orange
+    "MCS+": "#c49c94",     # brown-orange
+    "EMCS": "#9467bd",     # purple
+}
+
+
+def resolve_group_order(groups_present: Sequence[str]) -> List[str]:
+    """Order the diagnosis groups present: known clinical order first, then any
+    extras alphabetically. 'UNK' is dropped (not plotted)."""
+    present = list(dict.fromkeys(str(g) for g in groups_present))
+    ordered = [g for g in PREFERRED_GROUP_ORDER if g in present]
+    extras = sorted(g for g in present if g not in PREFERRED_GROUP_ORDER and g != "UNK")
+    return ordered + extras
+
+
+def resolve_group_colors(order: Sequence[str]) -> Dict[str, str]:
+    """Map each group to a colour: fixed hues for known labels, tab10 for the rest."""
+    import matplotlib.cm as cm
+    colors: Dict[str, str] = {}
+    tab = cm.get_cmap("tab10")
+    unknown_i = 0
+    for g in order:
+        if g in KNOWN_GROUP_COLORS:
+            colors[g] = KNOWN_GROUP_COLORS[g]
+        else:
+            colors[g] = tab(unknown_i % 10)
+            unknown_i += 1
+    return colors
+
 
 @dataclass
 class LatentBundle:
@@ -70,6 +107,24 @@ class LatentBundle:
 
     def __len__(self):
         return self.embeds.shape[0]
+
+
+def _raw_matrix_for(g, x_np: Optional[np.ndarray] = None, eps: float = 1e-8) -> np.ndarray:
+    """Return the graph's connectivity matrix for cluster summaries.
+
+    Uses the stored `raw_matrix` when present (wSMI mode). For time-series graphs
+    it is omitted to save RAM, so recompute the per-channel Pearson correlation
+    from the node features (invariant to the global affine normalization).
+    """
+    rm = getattr(g, "raw_matrix", None)
+    if rm is not None:
+        return np.asarray(rm)
+    if x_np is None:
+        x_np = g.x.detach().cpu().numpy()
+    centered = x_np - x_np.mean(axis=1, keepdims=True)
+    std = centered.std(axis=1, keepdims=True).clip(min=eps)
+    normed = centered / std
+    return ((normed @ normed.T) / x_np.shape[1]).astype(np.float32)
 
 
 def extract_latents_from_graphs(
@@ -115,7 +170,56 @@ def extract_latents_from_graphs(
             epochs.append(int(getattr(g, "matrix_idx", -1)))
             diagnoses.append(str(getattr(g, "diagnosis", "UNK")))
             diagnosis_groups.append(str(getattr(g, "diagnosis_group", "UNK")))
-            raw_matrices.append(np.asarray(getattr(g, "raw_matrix", None)))
+            raw_matrices.append(_raw_matrix_for(g))
+            splits_out.append(split)
+    return LatentBundle(
+        embeds=np.stack(embeds, axis=0).astype(np.float32),
+        subject_ids=subject_ids,
+        sessions=sessions,
+        epochs=epochs,
+        diagnoses=diagnoses,
+        diagnosis_groups=diagnosis_groups,
+        raw_matrices=raw_matrices,
+        splits=splits_out,
+    )
+
+
+def extract_embeddings_encoder(
+    model,
+    graphs: Sequence,
+    splits: Sequence[str],
+    device: Optional[torch.device] = None,
+) -> LatentBundle:
+    """Latent extraction for the encoder-only `enc_gae_fc` (GNNEncoder).
+
+    Unlike the autoencoders, this model already returns ONE embedding per graph
+    (it pools over nodes internally), so there is no node-level aggregation.
+    Packages the same LatentBundle fields so the clustering / dynamics / decoder
+    tools run unchanged.
+    """
+    if len(graphs) != len(splits):
+        raise ValueError("graphs and splits must have equal length")
+    if device is None:
+        device = next(model.parameters()).device
+    model.eval()
+
+    embeds = []
+    subject_ids, sessions, epochs = [], [], []
+    diagnoses, diagnosis_groups = [], []
+    raw_matrices = []
+    splits_out = []
+    with torch.no_grad():
+        for g, split in zip(graphs, splits):
+            x = g.x.to(device)
+            edge_index = g.edge_index.to(device)
+            z = model(x, edge_index, batch=None)  # (1, latent_dim)
+            embeds.append(z.squeeze(0).detach().cpu().numpy())
+            subject_ids.append(str(getattr(g, "subject_id", "unknown")))
+            sessions.append(str(getattr(g, "session_num", "unknown")))
+            epochs.append(int(getattr(g, "matrix_idx", -1)))
+            diagnoses.append(str(getattr(g, "diagnosis", "UNK")))
+            diagnosis_groups.append(str(getattr(g, "diagnosis_group", "UNK")))
+            raw_matrices.append(_raw_matrix_for(g))
             splits_out.append(split)
     return LatentBundle(
         embeds=np.stack(embeds, axis=0).astype(np.float32),
@@ -266,13 +370,16 @@ def hdbscan_best(X: np.ndarray, min_sizes=(5, 10, 20, 50, 100)):
 
 def per_cluster_diagnosis_counts(
     labels: np.ndarray, diagnosis_groups: Sequence[str],
+    group_order: Optional[Sequence[str]] = None,
 ) -> pd.DataFrame:
     """Wide DataFrame: cluster x diagnosis_group counts (rows include noise=-1)."""
     rows = defaultdict(Counter)
     for c, dg in zip(labels, diagnosis_groups):
         rows[int(c)][dg] += 1
     clusters = sorted(rows.keys())
-    cols = [g for g in DIAG_GROUP_ORDER if any(g in r for r in rows.values())]
+    if group_order is None:
+        group_order = resolve_group_order(diagnosis_groups)
+    cols = [g for g in group_order if any(g in r for r in rows.values())]
     df = pd.DataFrame(
         [[rows[c].get(g, 0) for g in cols] for c in clusters],
         index=[f"cluster_{c}" for c in clusters],
@@ -302,18 +409,218 @@ def per_subject_modal_cluster(
     return pd.DataFrame(rows).sort_values(["diagnosis_group", "subject_id"]).reset_index(drop=True)
 
 
-def plot_prevalence(df: pd.DataFrame, title: str, out_path: str, normalize: bool = False):
+def per_subject_cluster_proportions(
+    labels: np.ndarray, subject_ids: Sequence[str], diagnosis_groups: Sequence[str],
+    clusters: Optional[Sequence[int]] = None,
+) -> pd.DataFrame:
+    """Per-subject cluster-occupancy proportions (long form).
+
+    For each subject, proportion(c) = #epochs in cluster c / #subject epochs, so a
+    subject's proportions sum to 1 across clusters (0 for clusters never visited).
+
+    Returns columns: subject_id, diagnosis_group, cluster, proportion.
+    """
+    if clusters is None:
+        clusters = sorted(set(int(l) for l in labels))
+    # Key by (subject, diagnosis_group): in fine mode a subject's diagnosis can
+    # differ across sessions, so each (subject, group) is its own unit (matches
+    # state_dynamics.per_subject_aggregate). In coarse mode this reduces to one
+    # unit per subject.
+    bag: Dict[Tuple[str, str], Counter] = defaultdict(Counter)
+    for s, c, dg in zip(subject_ids, labels, diagnosis_groups):
+        bag[(s, dg)][int(c)] += 1
+    rows = []
+    for (s, dg), ctr in bag.items():
+        n = sum(ctr.values())
+        for c in clusters:
+            rows.append({
+                "subject_id": s, "diagnosis_group": dg, "cluster": int(c),
+                "proportion": (ctr.get(int(c), 0) / n) if n > 0 else 0.0,
+            })
+    return pd.DataFrame(rows)
+
+
+def per_subject_within_cluster_share(
+    labels: np.ndarray, subject_ids: Sequence[str], diagnosis_groups: Sequence[str],
+    clusters: Optional[Sequence[int]] = None,
+) -> pd.DataFrame:
+    """Per-subject share of each cluster (column / within-cluster normalization).
+
+    For each (subject, diagnosis_group) unit, share(c) = #unit epochs in cluster c
+    / #total epochs in cluster c (across all units). Within a fixed cluster the
+    shares sum to 1 (it's normalized by the cluster's occupancy, not by the
+    subject's). This is the column-wise complement of
+    `per_subject_cluster_proportions` (which normalizes within each subject).
+
+    Returns columns: subject_id, diagnosis_group, cluster, share.
+    """
+    if clusters is None:
+        clusters = sorted(set(int(l) for l in labels))
+    cluster_total = {int(c): int((np.asarray(labels) == c).sum()) for c in clusters}
+    bag: Dict[Tuple[str, str], Counter] = defaultdict(Counter)
+    for s, c, dg in zip(subject_ids, labels, diagnosis_groups):
+        bag[(s, dg)][int(c)] += 1
+    rows = []
+    for (s, dg), ctr in bag.items():
+        for c in clusters:
+            tot = cluster_total[int(c)]
+            rows.append({
+                "subject_id": s, "diagnosis_group": dg, "cluster": int(c),
+                "share": (ctr.get(int(c), 0) / tot) if tot > 0 else 0.0,
+            })
+    return pd.DataFrame(rows)
+
+
+def group_modal_cluster_fractions(
+    labels: np.ndarray, subject_ids: Sequence[str], diagnosis_groups: Sequence[str],
+    clusters: Optional[Sequence[int]] = None,
+) -> pd.DataFrame:
+    """Fraction of each diagnosis group's subjects whose MODAL cluster is c.
+
+    For each subject, take their modal cluster (most-occupied). Then for each
+    diagnosis group, fraction(group, c) = #subjects-of-group with modal cluster c
+    / #subjects-of-group. These sum to 1 across clusters per group.
+
+    Returns columns: diagnosis_group, cluster, fraction, n_subjects.
+    """
+    if clusters is None:
+        clusters = sorted(set(int(l) for l in labels))
+    # Unit = (subject, diagnosis_group) so a session-varying diagnosis counts in
+    # each group it occurred in (see per_subject_cluster_proportions).
+    bag: Dict[Tuple[str, str], Counter] = defaultdict(Counter)
+    for s, c, dg in zip(subject_ids, labels, diagnosis_groups):
+        bag[(s, dg)][int(c)] += 1
+    # unit -> modal cluster
+    modal = {key: ctr.most_common(1)[0][0] for key, ctr in bag.items()}
+    # per group: count units by modal cluster
+    group_counts: Dict[str, Counter] = defaultdict(Counter)
+    group_n: Counter = Counter()
+    for (s, dg), mc in modal.items():
+        group_counts[dg][mc] += 1
+        group_n[dg] += 1
+    rows = []
+    for g in group_counts:
+        for c in clusters:
+            rows.append({
+                "diagnosis_group": g, "cluster": int(c),
+                "fraction": group_counts[g].get(int(c), 0) / max(1, group_n[g]),
+                "n_subjects": int(group_n[g]),
+            })
+    return pd.DataFrame(rows)
+
+
+def _grouped_cluster_positions(n_clusters: int, n_groups: int, width: float = 0.8):
+    """Return (cluster_centers, per-group x-offsets, box_width) for grouped plots."""
+    centers = np.arange(n_clusters)
+    box_w = width / max(1, n_groups)
+    offsets = [(-width / 2) + box_w * (i + 0.5) for i in range(n_groups)]
+    return centers, offsets, box_w
+
+
+def plot_cluster_proportion_boxplots(
+    prop_df: pd.DataFrame, clusters: Sequence[int], out_path: str, title: str = "",
+    group_order: Optional[Sequence[str]] = None,
+    group_colors: Optional[Dict[str, str]] = None,
+    value_col: str = "proportion",
+    ylabel: str = "Per-subject proportion of epochs (sums to 1 over clusters)",
+):
+    """Grouped boxplots: x=cluster, one box per diagnosis group, y=`value_col`.
+    Subjects overlaid as jittered points. `value_col` is `proportion` (per-subject
+    normalization) or `share` (within-cluster normalization)."""
+    if group_order is None:
+        group_order = resolve_group_order(prop_df["diagnosis_group"].tolist())
+    if group_colors is None:
+        group_colors = resolve_group_colors(group_order)
+    groups = [g for g in group_order if g in set(prop_df["diagnosis_group"])]
+    clusters = list(clusters)
+    centers, offsets, box_w = _grouped_cluster_positions(len(clusters), len(groups))
+
+    fig, ax = plt.subplots(figsize=(max(7, 1.6 * len(clusters)), 5))
+    for gi, g in enumerate(groups):
+        gdf = prop_df[prop_df["diagnosis_group"] == g]
+        data = [gdf[gdf["cluster"] == c][value_col].values for c in clusters]
+        positions = [centers[ci] + offsets[gi] for ci in range(len(clusters))]
+        bp = ax.boxplot(data, positions=positions, widths=box_w * 0.9,
+                        patch_artist=True, showmeans=True, manage_ticks=False)
+        for patch in bp["boxes"]:
+            patch.set_facecolor(group_colors.get(g, "#cccccc"))
+            patch.set_alpha(0.55)
+        for med in bp["medians"]:
+            med.set_color("black")
+        # jittered points
+        for ci, c in enumerate(clusters):
+            vals = data[ci]
+            if len(vals):
+                jitter = np.random.normal(0, box_w * 0.12, size=len(vals))
+                ax.scatter(np.full(len(vals), positions[ci]) + jitter, vals,
+                           s=8, color="black", alpha=0.5, zorder=3)
+    ax.set_xticks(centers)
+    ax.set_xticklabels([str(c) for c in clusters])
+    ax.set_xlabel("Cluster")
+    ax.set_ylabel(ylabel)
+    if title:
+        ax.set_title(title)
+    handles = [plt.Rectangle((0, 0), 1, 1, color=group_colors.get(g, "#cccccc"),
+                             alpha=0.55) for g in groups]
+    ax.legend(handles, groups, title="diagnosis", fontsize=9)
+    ax.grid(True, alpha=0.3, axis="y")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close()
+
+
+def plot_group_modal_cluster_bars(
+    frac_df: pd.DataFrame, clusters: Sequence[int], out_path: str, title: str = "",
+    group_order: Optional[Sequence[str]] = None,
+    group_colors: Optional[Dict[str, str]] = None,
+):
+    """Grouped bar chart: x=cluster, one bar per diagnosis group, height=fraction
+    of that group's subjects whose modal cluster is c (sums to 1 across clusters
+    per group)."""
+    if group_order is None:
+        group_order = resolve_group_order(frac_df["diagnosis_group"].tolist())
+    if group_colors is None:
+        group_colors = resolve_group_colors(group_order)
+    groups = [g for g in group_order if g in set(frac_df["diagnosis_group"])]
+    clusters = list(clusters)
+    centers, offsets, bar_w = _grouped_cluster_positions(len(clusters), len(groups))
+
+    fig, ax = plt.subplots(figsize=(max(7, 1.6 * len(clusters)), 5))
+    for gi, g in enumerate(groups):
+        gdf = frac_df[frac_df["diagnosis_group"] == g].set_index("cluster")
+        heights = [float(gdf.loc[c, "fraction"]) if c in gdf.index else 0.0
+                   for c in clusters]
+        positions = [centers[ci] + offsets[gi] for ci in range(len(clusters))]
+        ax.bar(positions, heights, width=bar_w * 0.9,
+               color=group_colors.get(g, "#cccccc"), alpha=0.85, label=g)
+    ax.set_xticks(centers)
+    ax.set_xticklabels([str(c) for c in clusters])
+    ax.set_xlabel("Cluster")
+    ax.set_ylabel("Fraction of group's subjects (modal cluster; sums to 1)")
+    if title:
+        ax.set_title(title)
+    ax.legend(title="diagnosis", fontsize=9)
+    ax.grid(True, alpha=0.3, axis="y")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close()
+
+
+def plot_prevalence(df: pd.DataFrame, title: str, out_path: str, normalize: bool = False,
+                    group_colors: Optional[Dict[str, str]] = None):
     if normalize:
         plot_df = df.div(df.sum(axis=1).replace(0, 1), axis=0)
         ylabel = "Proportion"
     else:
         plot_df = df
         ylabel = "Count"
+    if group_colors is None:
+        group_colors = resolve_group_colors(list(plot_df.columns))
     fig, ax = plt.subplots(figsize=(max(6, 0.7 * len(plot_df)), 5))
     bottom = np.zeros(len(plot_df))
     for g in plot_df.columns:
         ax.bar(plot_df.index, plot_df[g].values, bottom=bottom,
-               label=g, color=DIAG_GROUP_COLORS.get(g, "#999999"))
+               label=g, color=group_colors.get(g, "#999999"))
         bottom += plot_df[g].values
     ax.set_title(title)
     ax.set_ylabel(ylabel)
@@ -478,13 +785,19 @@ def per_subject_entropy(
     return pd.DataFrame(rows).sort_values(["diagnosis_group", "subject_id"]).reset_index(drop=True)
 
 
-def plot_per_subject_entropy(df: pd.DataFrame, out_path: str, title: str = ""):
+def plot_per_subject_entropy(df: pd.DataFrame, out_path: str, title: str = "",
+                             group_order: Optional[Sequence[str]] = None,
+                             group_colors: Optional[Dict[str, str]] = None):
     fig, ax = plt.subplots(figsize=(8, 5))
-    groups = [g for g in DIAG_GROUP_ORDER if g in df["diagnosis_group"].unique()]
+    if group_order is None:
+        group_order = resolve_group_order(df["diagnosis_group"].tolist())
+    if group_colors is None:
+        group_colors = resolve_group_colors(group_order)
+    groups = [g for g in group_order if g in df["diagnosis_group"].unique()]
     data = [df[df["diagnosis_group"] == g]["shannon_entropy"].values for g in groups]
     bp = ax.boxplot(data, labels=groups, patch_artist=True, showmeans=True)
     for patch, g in zip(bp["boxes"], groups):
-        patch.set_facecolor(DIAG_GROUP_COLORS.get(g, "#cccccc"))
+        patch.set_facecolor(group_colors.get(g, "#cccccc"))
         patch.set_alpha(0.6)
     # overlay raw points
     for i, vals in enumerate(data, start=1):
@@ -536,6 +849,11 @@ def run_one_clusterer(
 ):
     os.makedirs(out_dir, exist_ok=True)
 
+    # Resolve diagnosis-group ordering + colours once (works for coarse + fine).
+    group_order = resolve_group_order(bundle.diagnosis_groups)
+    group_colors = resolve_group_colors(group_order)
+    clusters = sorted(set(int(l) for l in labels))
+
     # Cluster counts / assignments
     assignments = pd.DataFrame({
         "subject_id": bundle.subject_ids,
@@ -549,16 +867,48 @@ def run_one_clusterer(
     assignments.to_csv(os.path.join(out_dir, "assignments.csv"), index=False)
 
     # (a) prevalence
-    counts = per_cluster_diagnosis_counts(labels, bundle.diagnosis_groups)
+    counts = per_cluster_diagnosis_counts(labels, bundle.diagnosis_groups, group_order)
     counts.to_csv(os.path.join(out_dir, "prevalence_counts.csv"))
     plot_prevalence(counts, f"{name}: diagnosis_group per cluster (counts)",
-                    os.path.join(out_dir, "prevalence_counts.png"), normalize=False)
+                    os.path.join(out_dir, "prevalence_counts.png"), normalize=False,
+                    group_colors=group_colors)
     plot_prevalence(counts, f"{name}: diagnosis_group per cluster (proportions)",
-                    os.path.join(out_dir, "prevalence_proportions.png"), normalize=True)
+                    os.path.join(out_dir, "prevalence_proportions.png"), normalize=True,
+                    group_colors=group_colors)
 
     subj_modal = per_subject_modal_cluster(
         labels, bundle.subject_ids, bundle.diagnosis_groups)
     subj_modal.to_csv(os.path.join(out_dir, "subject_modal_cluster.csv"), index=False)
+
+    # (a2) per-cluster occupancy plots grouped by diagnosis.
+    #   Plot A: per-subject proportions (sum to 1 across clusters per subject).
+    prop_df = per_subject_cluster_proportions(
+        labels, bundle.subject_ids, bundle.diagnosis_groups, clusters)
+    prop_df.to_csv(os.path.join(out_dir, "per_subject_cluster_proportions.csv"), index=False)
+    plot_cluster_proportion_boxplots(
+        prop_df, clusters, os.path.join(out_dir, "cluster_proportion_boxplots.png"),
+        title=f"{name}: per-subject cluster occupancy by diagnosis",
+        group_order=group_order, group_colors=group_colors)
+    #   Plot A2: same boxplots, normalized WITHIN each cluster (shares sum to 1
+    #   over subjects in a cluster) — i.e. normalized by the cluster's occupancy.
+    share_df = per_subject_within_cluster_share(
+        labels, bundle.subject_ids, bundle.diagnosis_groups, clusters)
+    share_df.to_csv(os.path.join(out_dir, "per_subject_within_cluster_share.csv"), index=False)
+    plot_cluster_proportion_boxplots(
+        share_df, clusters,
+        os.path.join(out_dir, "cluster_proportion_boxplots_within_cluster.png"),
+        title=f"{name}: within-cluster subject shares by diagnosis",
+        group_order=group_order, group_colors=group_colors,
+        value_col="share",
+        ylabel="Per-subject share of the cluster (sums to 1 within a cluster)")
+    #   Plot B: per-group modal-cluster subject fractions (sum to 1 per group).
+    frac_df = group_modal_cluster_fractions(
+        labels, bundle.subject_ids, bundle.diagnosis_groups, clusters)
+    frac_df.to_csv(os.path.join(out_dir, "group_modal_cluster_fractions.csv"), index=False)
+    plot_group_modal_cluster_bars(
+        frac_df, clusters, os.path.join(out_dir, "group_modal_cluster_bars.png"),
+        title=f"{name}: modal-cluster subject fractions by diagnosis",
+        group_order=group_order, group_colors=group_colors)
 
     # (b) per-cluster mean matrices
     means = cluster_mean_matrices(labels, bundle.raw_matrices)
@@ -574,6 +924,7 @@ def run_one_clusterer(
     plot_per_subject_entropy(
         subj_H, os.path.join(out_dir, "per_subject_entropy_box.png"),
         title=f"{name}: per-subject cluster-occupancy entropy",
+        group_order=group_order, group_colors=group_colors,
     )
 
     # metric curve

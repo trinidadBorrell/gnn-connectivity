@@ -22,7 +22,7 @@ Subject IDs:
 import os
 import pickle
 import re
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -47,6 +47,10 @@ DIAGNOSIS_GROUP_MAP = {
     "MCS": "MCS",
     # EMCS / COMA intentionally absent -> resolved to "DROP" and filtered out
 }
+
+# Fine granularity: keep the raw diagnostic_crs_final label (so MCS-, MCS+, EMCS,
+# COMA stay distinct and are NOT dropped). VS is the single merge -> UWS.
+FINE_DIAGNOSIS_GROUP_MAP = {"VS": "UWS"}
 
 DROP_GROUP = "DROP"
 
@@ -91,12 +95,16 @@ def _is_control(subject_id: str) -> bool:
 
 
 def _resolve_diagnosis(
-    subject_id: str, session: str, lookup: Dict[Tuple[str, str], str]
+    subject_id: str, session: str, lookup: Dict[Tuple[str, str], str],
+    granularity: str = "coarse",
 ) -> Tuple[str, str]:
     """Return (diagnosis, diagnosis_group).
 
-    diagnosis_group is one of {CONTROL, UWS, MCS, DROP}. The DROP sentinel
-    covers EMCS, COMA, and unlabeled patients; callers filter these out.
+    granularity="coarse" -> diagnosis_group in {CONTROL, UWS, MCS, DROP}; the DROP
+    sentinel covers EMCS, COMA, and unlabeled patients (callers filter these out).
+    granularity="fine" -> diagnosis_group is the raw diagnostic_crs_final label
+    (UWS, MCS-, MCS+, EMCS, COMA, ...) with the single merge VS -> UWS; EMCS/COMA
+    are kept. Controls are CONTROL; only missing/unknown diagnoses are DROP.
     """
     if _is_control(subject_id):
         return "HC", "CONTROL"
@@ -108,6 +116,8 @@ def _resolve_diagnosis(
                 break
     if diag is None:
         return "UNK", DROP_GROUP
+    if granularity == "fine":
+        return diag, FINE_DIAGNOSIS_GROUP_MAP.get(diag, diag)
     return diag, DIAGNOSIS_GROUP_MAP.get(diag, DROP_GROUP)
 
 
@@ -179,10 +189,14 @@ def _iter_wsmi_files(root: str):
 
 def load_wsmi_dataset(
     patient_dir: str,
-    control_dir: str,
+    control_dir: Optional[str],
     diagnosis_csv: str,
     coords_file: str,
     k: int = 6,
+    subject_filter: Optional[set] = None,
+    granularity: str = "coarse",
+    max_epochs_per_recording: Optional[int] = None,
+    seed: int = 42,
     verbose: bool = True,
 ) -> Tuple[List[Data], List[str], List[str]]:
     """
@@ -201,12 +215,17 @@ def load_wsmi_dataset(
     edge_index = torch.tensor(
         np.array(adjacency.tocoo().nonzero()), dtype=torch.long
     )
+    rng = np.random.default_rng(seed)
 
     graphs: List[Data] = []
     subject_ids: List[str] = []
     diagnosis_groups: List[str] = []
 
     for root, group_name in ((patient_dir, "patient"), (control_dir, "control")):
+        if root is None:
+            if verbose:
+                print(f"  skipping {group_name} cohort (control_dir=None)")
+            continue
         if not os.path.isdir(root):
             if verbose:
                 print(f"  skipping missing folder: {root}")
@@ -215,6 +234,8 @@ def load_wsmi_dataset(
         n_epochs = 0
         n_dropped = 0
         for sub_id, ses, acq, pkl_path in _iter_wsmi_files(root):
+            if subject_filter is not None and sub_id not in subject_filter:
+                continue
             n_files += 1
             try:
                 arr = _load_pkl_data(pkl_path)  # (1, n_epochs, 64, 64)
@@ -227,30 +248,40 @@ def load_wsmi_dataset(
                     print(f"  WARN unexpected shape {arr.shape} in {pkl_path}")
                 continue
             epoch_mats = arr[0]
-            diag, diag_group = _resolve_diagnosis(sub_id, ses, lookup)
+            diag, diag_group = _resolve_diagnosis(sub_id, ses, lookup, granularity)
             if diag_group == DROP_GROUP:
                 n_dropped += 1
                 continue
-            for epoch_idx in range(epoch_mats.shape[0]):
+            n_ep = epoch_mats.shape[0]
+            epoch_indices = range(n_ep)
+            if max_epochs_per_recording is not None and n_ep > max_epochs_per_recording:
+                epoch_indices = sorted(
+                    rng.choice(n_ep, size=max_epochs_per_recording, replace=False))
+            for epoch_idx in epoch_indices:
                 mat = _symmetrize_and_clean(epoch_mats[epoch_idx])
                 x = torch.tensor(mat, dtype=torch.float32)
                 data = Data(x=x, edge_index=edge_index)
                 data.subject_id = sub_id
                 data.session_num = ses
                 data.acq = acq
-                data.matrix_idx = epoch_idx
+                data.matrix_idx = int(epoch_idx)
                 data.diagnosis = diag
                 data.diagnosis_group = diag_group
                 data.group = group_name
                 data.electrode_labels = electrode_labels
-                data.raw_matrix = mat  # numpy, for downstream cluster-mean
+                # raw_matrix doubles as the Mahalanobis outlier-filter basis here
+                # (the filter falls back to raw_matrix when wsmi_matrix is absent),
+                # so we keep a single copy rather than two.
+                data.raw_matrix = mat
                 graphs.append(data)
                 subject_ids.append(sub_id)
                 diagnosis_groups.append(diag_group)
                 n_epochs += 1
         if verbose:
+            dropped_reason = ("unlabeled only; EMCS/COMA kept"
+                              if granularity == "fine" else "EMCS/COMA/unlabeled")
             print(f"  {group_name}: {n_files} files, {n_epochs} epoch-graphs from {root} "
-                  f"(dropped {n_dropped} recordings with EMCS/COMA/UNK)")
+                  f"(dropped {n_dropped} recordings: {dropped_reason})")
 
     if verbose:
         print(f"Total graphs: {len(graphs)}; unique subjects: {len(set(subject_ids))}")

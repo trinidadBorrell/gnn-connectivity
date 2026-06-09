@@ -26,7 +26,24 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import os
 from datetime import datetime
-from model import GAE, VGAE, kl_divergence
+from model import GAE, GAEVAE, VGAE, GNNEncoder, kl_divergence
+from correlation_loss import corr_loss
+
+
+def _select_model_class(model_kind: str):
+    """Map a model_kind string to its class. Raises on unknown values."""
+    table = {"gae": GAE, "vgae": VGAE, "gae_vae": GAEVAE, "enc_gae_fc": GNNEncoder}
+    try:
+        return table[model_kind]
+    except KeyError:
+        raise ValueError(
+            f"unknown model_kind={model_kind!r}; expected one of {sorted(table)}"
+        )
+
+
+def _is_variational(model_kind: str) -> bool:
+    """VGAE and GAEVAE both have a variational bottleneck (return mu/log_var)."""
+    return model_kind in ("vgae", "gae_vae")
 
 try:
     import psutil
@@ -199,21 +216,24 @@ def compute_mse_on_graphs(model, graph_list, device=None, batch_size=64, variati
 
 
 def train_one_epoch(model, optimizer, criterion, loader, device=None,
-                    variational=False, beta=0.0):
+                    variational=False, beta=0.0, corr_lambda=0.0):
     """Train model for one epoch using a pre-built PyG DataLoader.
 
     Args:
-        model: The model to train (GAE or VGAE)
+        model: The model to train (GAE, VGAE, or GAEVAE)
         optimizer: Optimizer
-        criterion: Loss function (reconstruction)
+        criterion: Loss function (reconstruction MSE)
         loader: Pre-created PyG DataLoader (created once, reused every epoch)
         device: Device to use
         variational: If True, expect model to return (x_recon, z, mu, log_var) and
                     add `beta * KL(q(z|x) || N(0,I))` to the loss.
         beta: Weight on the KL term (typically ramped via KL warm-up).
+        corr_lambda: Weight on the Pearson-correlation-preservation regularizer.
+            If > 0, adds `corr_lambda * MSE(corr(x_recon), corr(x))` to the loss.
 
     Returns:
-        (avg_total_loss, avg_recon_loss, avg_kl).  avg_kl is 0.0 for non-variational.
+        (avg_total_loss, avg_recon_loss, avg_kl, avg_corr).
+        avg_kl is 0.0 for non-variational; avg_corr is 0.0 when corr_lambda == 0.
     """
     if device is None:
         device = torch.device('cpu')
@@ -222,6 +242,7 @@ def train_one_epoch(model, optimizer, criterion, loader, device=None,
     total_loss = 0.0
     total_recon = 0.0
     total_kl = 0.0
+    total_corr = 0.0
     num_batches = 0
 
     for batch in loader:
@@ -230,14 +251,18 @@ def train_one_epoch(model, optimizer, criterion, loader, device=None,
         out = model(batch.x, batch.edge_index)
         x_recon = out[0]
         recon_loss = criterion(x_recon, batch.x)
+        loss = recon_loss
 
         if variational:
             mu, log_var = out[2], out[3]
             kl = kl_divergence(mu, log_var)
-            loss = recon_loss + beta * kl
+            loss = loss + beta * kl
             total_kl += kl.item()
-        else:
-            loss = recon_loss
+
+        if corr_lambda > 0:
+            c_loss = corr_loss(batch.x, x_recon, num_graphs=batch.num_graphs)
+            loss = loss + corr_lambda * c_loss
+            total_corr += c_loss.item()
 
         loss.backward()
         optimizer.step()
@@ -246,8 +271,9 @@ def train_one_epoch(model, optimizer, criterion, loader, device=None,
         num_batches += 1
 
     if num_batches == 0:
-        return 0.0, 0.0, 0.0
-    return total_loss / num_batches, total_recon / num_batches, total_kl / num_batches
+        return 0.0, 0.0, 0.0, 0.0
+    return (total_loss / num_batches, total_recon / num_batches,
+            total_kl / num_batches, total_corr / num_batches)
 
 
 def _build_hidden_dims(num_layers):
@@ -285,7 +311,7 @@ def ray_trainable(config, train_graphs=None, val_graphs=None):
         else:
             beta = 0.0
 
-        total_loss, recon_loss, kl_loss = train_one_epoch(
+        total_loss, recon_loss, kl_loss, _corr_loss = train_one_epoch(
             model, optimizer, criterion, train_graphs,
             variational=variational, beta=beta,
         )
@@ -302,10 +328,10 @@ def ray_trainable(config, train_graphs=None, val_graphs=None):
 
 
 def ray_trainable_wsmi(config, train_graphs=None, val_graphs=None):
-    """Ray Tune trainable for the wSMI pipeline.
+    """Ray Tune trainable for the wSMI / time-series pipeline.
 
     Wider search space than ray_trainable: hidden_dims, batch_size,
-    weight_decay, KL warmup, and beta_kl are all tunable.
+    weight_decay, KL warmup, beta_kl, corr_lambda, and model_kind are all tunable.
     Uses a PyG DataLoader so trials respect the searched batch_size.
     """
     from ray import tune as ray_tune
@@ -319,11 +345,14 @@ def ray_trainable_wsmi(config, train_graphs=None, val_graphs=None):
     weight_decay = config.get("weight_decay", 0.0)
     batch_size = config.get("batch_size", 64)
     n_epochs = config.get("n_epochs", 80)
-    variational = config.get("variational", False)
+    model_kind = config.get("model_kind",
+                            "vgae" if config.get("variational", False) else "gae")
+    variational = _is_variational(model_kind)
     beta_max = config.get("beta_kl", 1.0)
     kl_warmup_epochs = config.get("kl_warmup_epochs", 10)
+    corr_lambda = config.get("corr_lambda", 0.0)
 
-    ModelCls = VGAE if variational else GAE
+    ModelCls = _select_model_class(model_kind)
     model = ModelCls(in_channels, hidden_dims=hidden_dims,
                      latent_dim=latent_dim, dropout=dropout)
     optimizer = torch.optim.AdamW(
@@ -338,9 +367,9 @@ def ray_trainable_wsmi(config, train_graphs=None, val_graphs=None):
             beta = beta_max * min(1.0, epoch / max(1, kl_warmup_epochs))
         else:
             beta = 0.0
-        total_loss, recon_loss, kl_loss = train_one_epoch(
+        total_loss, recon_loss, kl_loss, c_loss = train_one_epoch(
             model, optimizer, criterion, loader,
-            variational=variational, beta=beta,
+            variational=variational, beta=beta, corr_lambda=corr_lambda,
         )
         val_mse = compute_mse_on_graphs(model, val_graphs,
                                         variational=variational)
@@ -349,19 +378,31 @@ def ray_trainable_wsmi(config, train_graphs=None, val_graphs=None):
             "train_loss": total_loss,
             "recon_loss": recon_loss,
             "kl_loss": kl_loss,
+            "corr_loss": c_loss,
             "beta": beta,
             "epoch": epoch,
         })
 
 
 def run_ray_tune_wsmi(train_graphs, val_graphs, in_channels,
-                      variational=False, num_samples=20, n_epochs=80,
+                      model_kind="gae", num_samples=20, n_epochs=80,
                       grace_period=10, cpus_per_trial=2,
-                      storage_path=None):
-    """Wider ASHA search for the wSMI pipeline. Returns best config dict + analysis dataframe."""
+                      storage_path=None, corr_lambda_search=False,
+                      max_concurrent_trials=None):
+    """Wider ASHA search for the wSMI / time-series pipeline.
+
+    Args:
+        model_kind: one of {"gae", "vgae", "gae_vae"} — picks the model class and
+            whether to tune KL-related hyperparameters.
+        corr_lambda_search: if True, tune the Pearson-correlation regularizer
+            weight in the search space (use in time-series mode).
+    Returns best config dict + analysis dataframe.
+    """
     import ray
     from ray import tune
     from ray.tune.schedulers import ASHAScheduler
+
+    variational = _is_variational(model_kind)
 
     src_dir = os.path.dirname(os.path.abspath(__file__))
     if not ray.is_initialized():
@@ -381,11 +422,15 @@ def run_ray_tune_wsmi(train_graphs, val_graphs, in_channels,
         "batch_size": tune.choice([32, 64]),
         "weight_decay": tune.loguniform(1e-6, 1e-3),
         "n_epochs": n_epochs,
+        "model_kind": model_kind,
+        # kept for backward compat with callers that still read 'variational'
         "variational": variational,
     }
     if variational:
         search_space["beta_kl"] = tune.choice([0.001, 0.01, 0.1, 1.0])
         search_space["kl_warmup_epochs"] = tune.choice([0, 10, 30])
+    if corr_lambda_search:
+        search_space["corr_lambda"] = tune.loguniform(1e-2, 1e1)
 
     scheduler = ASHAScheduler(
         time_attr="epoch", max_t=n_epochs,
@@ -394,11 +439,16 @@ def run_ray_tune_wsmi(train_graphs, val_graphs, in_channels,
     trainable = tune.with_parameters(
         ray_trainable_wsmi, train_graphs=train_graphs, val_graphs=val_graphs,
     )
+    # max_concurrent_trials caps how many trials run at once. Each concurrent trial
+    # deserializes its OWN copy of train/val graphs from the object store, so peak
+    # RAM ~ dataset_size * (1 + max_concurrent_trials). Cap it on memory-limited
+    # machines (None = let Ray use all cpus / cpus_per_trial).
     tune_config = tune.TuneConfig(
         metric="val_mse", mode="min", scheduler=scheduler,
         num_samples=num_samples,
+        max_concurrent_trials=max_concurrent_trials,  # None = unlimited
     )
-    run_config_kwargs = {"name": f"wsmi_{'vgae' if variational else 'gae'}_asha"}
+    run_config_kwargs = {"name": f"wsmi_{model_kind}_asha"}
     if storage_path is not None:
         run_config_kwargs["storage_path"] = os.path.abspath(storage_path)
     tuner = tune.Tuner(
@@ -746,7 +796,7 @@ class TrainGAE:
             else:
                 beta = 0.0
 
-            train_loss, recon_loss, kl_loss = train_one_epoch(
+            train_loss, recon_loss, kl_loss, _corr_loss = train_one_epoch(
                 model, optimizer, criterion, train_loader, device=device,
                 variational=variational, beta=beta,
             )
