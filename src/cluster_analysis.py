@@ -254,8 +254,9 @@ def save_latent_bundle(bundle: LatentBundle, out_dir: str) -> None:
 
 
 def kmeans_best_k(X: np.ndarray, k_range=range(2, 11), random_state: int = 42):
+    ks = list(k_range)
     sils, fitted = [], {}
-    for k in k_range:
+    for k in ks:
         if k >= X.shape[0]:
             sils.append(-1.0)
             continue
@@ -266,20 +267,31 @@ def kmeans_best_k(X: np.ndarray, k_range=range(2, 11), random_state: int = 42):
             continue
         sils.append(float(silhouette_score(X, labels)))
         fitted[k] = (km, labels)
-    best_k = list(k_range)[int(np.argmax(sils))]
-    km, labels = fitted[best_k]
-    return labels, best_k, {"k": list(k_range), "silhouette": sils, "best_k": best_k}
+    if not fitted:
+        # Degenerate case (e.g. fewer samples than 2): one cluster, no crash.
+        return (np.zeros(X.shape[0], dtype=int), 1,
+                {"k": ks, "silhouette": sils, "best_k": 1})
+    # Pick the best k AMONG successfully fitted ones (argmax over all k can land
+    # on a skipped/failed k that isn't in `fitted`).
+    best_k = max(fitted, key=lambda k: sils[ks.index(k)])
+    _, labels = fitted[best_k]
+    return labels, best_k, {"k": ks, "silhouette": sils, "best_k": best_k}
 
 
 def gmm_best_k(X: np.ndarray, k_range=range(2, 11), random_state: int = 42):
+    ks = list(k_range)
+    # 'full' covariance needs a D×D matrix per component, which is singular /
+    # explodes when D is large (e.g. 64*latent_dim with --graph_latent_agg flatten).
+    # Use 'diag' for high-dim embeddings; keep 'full' for compact ones.
+    cov_type = "full" if X.shape[1] <= 32 else "diag"
     bics, fitted = [], {}
-    for k in k_range:
+    for k in ks:
         if k >= X.shape[0]:
             bics.append(np.inf)
             continue
         try:
             gmm = GaussianMixture(
-                n_components=k, covariance_type="full",
+                n_components=k, covariance_type=cov_type,
                 random_state=random_state, n_init=3, max_iter=200,
             )
             gmm.fit(X)
@@ -287,9 +299,15 @@ def gmm_best_k(X: np.ndarray, k_range=range(2, 11), random_state: int = 42):
             fitted[k] = (gmm, gmm.predict(X))
         except Exception:
             bics.append(np.inf)
-    best_k = list(k_range)[int(np.argmin(bics))]
-    gmm, labels = fitted[best_k]
-    return labels, best_k, {"k": list(k_range), "bic": bics, "best_k": best_k}
+    if not fitted:
+        return (np.zeros(X.shape[0], dtype=int), 1,
+                {"k": ks, "bic": bics, "best_k": 1, "covariance_type": cov_type})
+    # Best k AMONG fitted ones (guards KeyError when the global argmin is a
+    # skipped/failed k).
+    best_k = min(fitted, key=lambda k: bics[ks.index(k)])
+    _, labels = fitted[best_k]
+    return labels, best_k, {"k": ks, "bic": bics, "best_k": best_k,
+                            "covariance_type": cov_type}
 
 
 def hdbscan_best(X: np.ndarray, min_sizes=(5, 10, 20, 50, 100)):
@@ -387,6 +405,24 @@ def per_cluster_diagnosis_counts(
     )
     df.index.name = "cluster"
     return df
+
+
+def per_diagnosis_cluster_occupancy(
+    labels: np.ndarray, diagnosis_groups: Sequence[str],
+    group_order: Optional[Sequence[str]] = None,
+) -> pd.DataFrame:
+    """MATRIX-LEVEL state occupancy P(cluster | diagnosis) — the Della-Bella view.
+
+    Counts every matrix (epoch), ignoring subjects. For each diagnosis group g and
+    cluster c: occupancy[c, g] = (#matrices of g in c) / (#matrices of g over ALL
+    clusters). So each **column (diagnosis) sums to 1 across clusters** — "of all UWS
+    matrices, what fraction lands in each state".
+
+    Toy: cluster_0 has 3 UWS, cluster_1 has 1 UWS -> UWS column = [0.75, 0.25].
+    """
+    counts = per_cluster_diagnosis_counts(labels, diagnosis_groups, group_order)
+    occ = counts.div(counts.sum(axis=0).replace(0, 1), axis=1)
+    return occ
 
 
 def per_subject_modal_cluster(
@@ -563,6 +599,104 @@ def plot_cluster_proportion_boxplots(
     handles = [plt.Rectangle((0, 0), 1, 1, color=group_colors.get(g, "#cccccc"),
                              alpha=0.55) for g in groups]
     ax.legend(handles, groups, title="diagnosis", fontsize=9)
+    ax.grid(True, alpha=0.3, axis="y")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close()
+
+
+def plot_prevalence_proportion_boxplots(
+    share_df: pd.DataFrame, prevalence_prop: pd.DataFrame, clusters: Sequence[int],
+    out_path: str, title: str = "",
+    group_order: Optional[Sequence[str]] = None,
+    group_colors: Optional[Dict[str, str]] = None,
+):
+    """The `prevalence_proportions` numbers shown with per-subject spread.
+
+    For a fixed cluster c, prevalence_proportion[c, g] = (#epochs of group g in c) /
+    (#epochs in c) = the SUM over group-g subjects of their within-cluster share[s, c].
+    So this plots, per cluster and per diagnosis group, the BOXPLOT of the per-subject
+    within-cluster shares (one point per subject), and marks the group's
+    prevalence_proportion (their sum) as a ★. Box = the per-subject pieces; ★ = the
+    single prevalence number. Boxes within a cluster sum (over all groups/subjects) to 1.
+
+    `share_df`: columns subject_id, diagnosis_group, cluster, share.
+    `prevalence_prop`: rows 'cluster_<c>', columns = diagnosis groups, row-normalized
+        (each row sums to 1) — i.e. plot_prevalence(normalize=True)'s data.
+    """
+    if group_order is None:
+        group_order = resolve_group_order(share_df["diagnosis_group"].tolist())
+    if group_colors is None:
+        group_colors = resolve_group_colors(group_order)
+    groups = [g for g in group_order if g in set(share_df["diagnosis_group"])]
+    clusters = list(clusters)
+    centers, offsets, box_w = _grouped_cluster_positions(len(clusters), len(groups))
+
+    fig, ax = plt.subplots(figsize=(max(7, 1.6 * len(clusters)), 5))
+    for gi, g in enumerate(groups):
+        gdf = share_df[share_df["diagnosis_group"] == g]
+        data = [gdf[gdf["cluster"] == c]["share"].values for c in clusters]
+        positions = [centers[ci] + offsets[gi] for ci in range(len(clusters))]
+        bp = ax.boxplot(data, positions=positions, widths=box_w * 0.9,
+                        patch_artist=True, showmeans=False, manage_ticks=False)
+        for patch in bp["boxes"]:
+            patch.set_facecolor(group_colors.get(g, "#cccccc"))
+            patch.set_alpha(0.55)
+        for med in bp["medians"]:
+            med.set_color("black")
+        for ci, c in enumerate(clusters):
+            vals = data[ci]
+            if len(vals):
+                jitter = np.random.normal(0, box_w * 0.12, size=len(vals))
+                ax.scatter(np.full(len(vals), positions[ci]) + jitter, vals,
+                           s=8, color="black", alpha=0.4, zorder=3)
+            # ★ at the prevalence_proportion (= sum of this group's shares in cluster c)
+            row = f"cluster_{c}"
+            if row in prevalence_prop.index and g in prevalence_prop.columns:
+                ax.scatter([positions[ci]], [float(prevalence_prop.loc[row, g])],
+                           marker="*", s=170, color=group_colors.get(g, "#cccccc"),
+                           edgecolor="black", linewidth=0.6, zorder=5)
+    ax.set_xticks(centers)
+    ax.set_xticklabels([str(c) for c in clusters])
+    ax.set_xlabel("Cluster")
+    ax.set_ylabel("within-cluster share per subject  (★ = group sum = prevalence_proportion)")
+    if title:
+        ax.set_title(title)
+    handles = [plt.Rectangle((0, 0), 1, 1, color=group_colors.get(g, "#cccccc"),
+                             alpha=0.55) for g in groups]
+    ax.legend(handles, groups, title="diagnosis", fontsize=9)
+    ax.grid(True, alpha=0.3, axis="y")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close()
+
+
+def plot_state_occupancy_by_diagnosis(
+    occ: pd.DataFrame, out_path: str, title: str = "",
+    group_colors: Optional[Dict[str, str]] = None,
+):
+    """Grouped bars of MATRIX-LEVEL occupancy P(cluster | diagnosis) (the Della-Bella
+    figure). x = cluster/state, one bar per diagnosis; each diagnosis's bars sum to 1
+    across clusters. `occ` is the output of `per_diagnosis_cluster_occupancy`
+    (rows = 'cluster_<c>', columns = diagnosis groups, each COLUMN sums to 1)."""
+    clusters = list(occ.index)
+    groups = list(occ.columns)
+    if group_colors is None:
+        group_colors = resolve_group_colors(groups)
+    centers, offsets, box_w = _grouped_cluster_positions(len(clusters), len(groups))
+    fig, ax = plt.subplots(figsize=(max(7, 1.6 * len(clusters)), 5))
+    for gi, g in enumerate(groups):
+        positions = [centers[ci] + offsets[gi] for ci in range(len(clusters))]
+        heights = [float(occ.loc[c, g]) for c in clusters]
+        ax.bar(positions, heights, width=box_w * 0.9,
+               color=group_colors.get(g, "#cccccc"), alpha=0.85, label=g)
+    ax.set_xticks(centers)
+    ax.set_xticklabels([c.replace("cluster_", "") for c in clusters])
+    ax.set_xlabel("Cluster / state")
+    ax.set_ylabel("P(cluster | diagnosis)  — each diagnosis sums to 1 across clusters")
+    if title:
+        ax.set_title(title)
+    ax.legend(title="diagnosis", fontsize=9)
     ax.grid(True, alpha=0.3, axis="y")
     plt.tight_layout()
     plt.savefig(out_path, dpi=200, bbox_inches="tight")
@@ -875,6 +1009,13 @@ def run_one_clusterer(
     plot_prevalence(counts, f"{name}: diagnosis_group per cluster (proportions)",
                     os.path.join(out_dir, "prevalence_proportions.png"), normalize=True,
                     group_colors=group_colors)
+    # (a1) MATRIX-LEVEL state occupancy P(cluster|diagnosis): each diagnosis sums to 1
+    # across clusters (Della-Bella view). Column-normalized complement of prevalence.
+    occ = per_diagnosis_cluster_occupancy(labels, bundle.diagnosis_groups, group_order)
+    occ.to_csv(os.path.join(out_dir, "state_occupancy_by_diagnosis.csv"))
+    plot_state_occupancy_by_diagnosis(
+        occ, os.path.join(out_dir, "state_occupancy_by_diagnosis.png"),
+        title=f"{name}: state occupancy P(cluster|diagnosis)", group_colors=group_colors)
 
     subj_modal = per_subject_modal_cluster(
         labels, bundle.subject_ids, bundle.diagnosis_groups)
@@ -901,6 +1042,14 @@ def run_one_clusterer(
         group_order=group_order, group_colors=group_colors,
         value_col="share",
         ylabel="Per-subject share of the cluster (sums to 1 within a cluster)")
+    #   Plot A3: the prevalence_proportions numbers, shown as per-subject share
+    #   boxplots with the prevalence (group sum) starred.
+    prevalence_prop = counts.div(counts.sum(axis=1).replace(0, 1), axis=0)
+    plot_prevalence_proportion_boxplots(
+        share_df, prevalence_prop, clusters,
+        os.path.join(out_dir, "prevalence_proportion_boxplots.png"),
+        title=f"{name}: prevalence proportions (★) with per-subject spread",
+        group_order=group_order, group_colors=group_colors)
     #   Plot B: per-group modal-cluster subject fractions (sum to 1 per group).
     frac_df = group_modal_cluster_fractions(
         labels, bundle.subject_ids, bundle.diagnosis_groups, clusters)

@@ -37,6 +37,11 @@
 #   MAX_EPOCHS=N      cap epochs/recording (subsamples lg; 150-300 is plenty for tuning).
 #   NUM_TRIALS=N      fewer ASHA samples (default 30) -> less time, slightly less RAM.
 #   CPUS_PER_TRIAL=N  more cpus/trial -> fewer parallel trials (another way to serialize).
+#   THREADS=N         cap BLAS/OMP/torch threads per process so the CPU is not maxed
+#                     (e.g. THREADS=6 on a 12-core machine leaves ~half the cores free).
+#   TRIM_GRAPHS=1     delete each run's splits/graphs.pt after it completes, so disk
+#                     stays bounded across the matrix (lg graphs.pt is ~1.4 GB each).
+#                     Re-running a trimmed run's cluster/latents stage needs a reload.
 #
 #   # Recommended memory-safe full run on a 24 GB Mac (all data, just slower):
 #   MAX_CONCURRENT=1 MAX_EPOCHS=200 bash gnn_connectivity/cookbook/run_experiments.sh
@@ -65,6 +70,14 @@ MAX_EPOCHS="${MAX_EPOCHS:-}"             # empty = use all epochs (full lg)
 MAX_CONCURRENT="${MAX_CONCURRENT:-2}"   # cap simultaneous tuning trials (0/empty = unlimited)
 NUM_TRIALS="${NUM_TRIALS:-}"            # empty = pipeline default (30)
 CPUS_PER_TRIAL="${CPUS_PER_TRIAL:-}"    # empty = pipeline default (2)
+# --- CPU headroom: cap BLAS/OMP/torch threads per process so the machine stays
+# usable. Empty = use all cores. With MAX_CONCURRENT=1, total busy cores ~= THREADS.
+THREADS="${THREADS:-}"
+if [ -n "$THREADS" ]; then
+  export OMP_NUM_THREADS="$THREADS" MKL_NUM_THREADS="$THREADS" \
+         OPENBLAS_NUM_THREADS="$THREADS" VECLIB_MAXIMUM_THREADS="$THREADS" \
+         NUMEXPR_NUM_THREADS="$THREADS"
+fi
 
 CPU_FLAG=""
 [ "${CPU:-0}" = "1" ] && CPU_FLAG="--cpu"
@@ -97,6 +110,9 @@ run () {
     echo "[FAIL] $name (exit $rc) — see $logdir/console.log"
   else
     echo "[done] $name"
+    # Keep disk bounded across the matrix: the cached dataset (splits/graphs.pt) is
+    # only needed within a run; drop it once the run finished successfully.
+    [ "${TRIM_GRAPHS:-0}" = "1" ] && rm -f "$logdir/splits/graphs.pt"
   fi
   return 0   # keep going to the next run regardless
 }
