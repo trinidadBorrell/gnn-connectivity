@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
 # Sequential experiment matrix for the GNN-connectivity pipeline.
 #
-#   GAE_VAE (full Ray Tune), 2-sigma outlier filter on:
+#   ALL 4 architectures. Each DECODER run trains gae + vgae + gae_vae from ONE data
+#   load (--models gae vgae gae_vae -> final_test/{gae,vgae,gae_vae}/), 2-sigma filter:
 #     wsmi  rs  patients+controls  mse        coarse,fine
-#     wsmi  rs  patients-only      mse        coarse,fine   (NEW)
+#     wsmi  rs  patients-only      mse        coarse,fine
 #     wsmi  lg  patients-only      mse        coarse,fine
 #     wsmi  lg  patients+controls  mse        coarse,fine   (control-inclusive lg)
 #     ts    rs  patients-only      mse_corr   coarse,fine
 #     ts    lg  patients-only      mse_corr   coarse,fine
 #     ts    lg  patients+controls  mse_corr   coarse,fine   (control-inclusive lg)
 #   enc_gae_fc / CEBRA (small grid tune), outlier filter on:
-#     ts    lg  patients-only      cebra      coarse,fine
-#     ts    lg  patients+controls  cebra      coarse,fine   (NEW)
-#     ts    rs  patients-only      cebra      coarse,fine   (NEW)
-#     ts    rs  patients+controls  cebra      coarse,fine   (NEW)
+#     ts    lg  patients{-only,+controls}     cebra      coarse,fine
+#     ts    rs  patients{-only,+controls}     cebra      coarse,fine
+#
+# ALL WINDOWS by default: no MAX_EPOCHS cap is applied — every epoch/window of each
+# recording is used. Set MAX_EPOCHS=N only on memory-limited machines (see below).
 #
 # Control-inclusive runs drop --patients_only so the pipeline auto-resolves the
 # control dirs from DATA_DEFAULTS[type_data] in run_wsmi_pipeline.py. Control lg/rs
@@ -22,8 +24,8 @@
 # Timeseries window: both rs and lg crop to -0.2..0.6 s (0.8 s); it depends only on
 # the data type, not the model (handled in run_wsmi_pipeline.py, not per-run flags).
 #
-# Runs sequentially, each logged to output/<run>/console.log, and is RESUMABLE:
-# a run whose final test_report.json already exists is skipped.
+# Runs sequentially, each logged to output/<run>/console.log, and is RESUMABLE: a
+# decoder run is skipped only when ALL of gae/vgae/gae_vae test_reports already exist.
 #
 # Usage:
 #   bash gnn_connectivity/cookbook/run_experiments.sh   # run everything (from repo root)
@@ -88,13 +90,21 @@ MEM_FLAGS=""
 [ -n "$NUM_TRIALS" ]     && MEM_FLAGS="$MEM_FLAGS --num_trials $NUM_TRIALS"
 [ -n "$CPUS_PER_TRIAL" ] && MEM_FLAGS="$MEM_FLAGS --cpus_per_trial $CPUS_PER_TRIAL"
 
-# run <name> <model> <test_subdir> <extra args...>
+# run <name> "<model_tags>" <extra args...>
+#   model_tags is a space-separated list of the architectures this run produces
+#   (e.g. "gae vgae gae_vae" or "enc_gae_fc"). The run is skipped only when EVERY
+#   tag's final_test/<tag>/test_report.json already exists (so a partially-done
+#   multi-architecture run still resumes).
 run () {
   local name="$1"; shift
-  local test_report="$OUT_ROOT/$name/final_test/$1/test_report.json"; shift
+  local tags="$1"; shift
   local logdir="$OUT_ROOT/$name"
-  if [ -f "$test_report" ]; then
-    echo "[skip] $name (already complete: $test_report)"
+  local all_done=1
+  for t in $tags; do
+    [ -f "$logdir/final_test/$t/test_report.json" ] || all_done=0
+  done
+  if [ "$all_done" = 1 ]; then
+    echo "[skip] $name (all of: $tags already complete)"
     return 0
   fi
   mkdir -p "$logdir"
@@ -117,30 +127,31 @@ run () {
   return 0   # keep going to the next run regardless
 }
 
-GV="--models gae_vae"            # decoder autoencoder
+DEC="--models gae vgae gae_vae"  # all 3 decoder autoencoders from one data load
+DT="gae vgae gae_vae"            # their test-report tags (for resumability)
 CB="--models enc_gae_fc --loss cebra --cebra_tune"
 
-# ---- GAE_VAE : MSE on wSMI ----
-run gaevae_rs_wsmi_mse_coarse gae_vae  $GV --input_mode wsmi --type_data rs --loss mse --diagnosis_granularity coarse
-run gaevae_rs_wsmi_mse_fine   gae_vae  $GV --input_mode wsmi --type_data rs --loss mse --diagnosis_granularity fine
-run gaevae_rs_wsmi_mse_coarse_ponly gae_vae  $GV --input_mode wsmi --type_data rs --loss mse --diagnosis_granularity coarse --patients_only
-run gaevae_rs_wsmi_mse_fine_ponly   gae_vae  $GV --input_mode wsmi --type_data rs --loss mse --diagnosis_granularity fine   --patients_only
-run gaevae_lg_wsmi_mse_coarse gae_vae  $GV --input_mode wsmi --type_data lg --loss mse --diagnosis_granularity coarse --patients_only
-run gaevae_lg_wsmi_mse_fine   gae_vae  $GV --input_mode wsmi --type_data lg --loss mse --diagnosis_granularity fine   --patients_only
+# ---- decoders (gae/vgae/gae_vae) : MSE on wSMI ----
+run rs_wsmi_mse_coarse "$DT"  $DEC --input_mode wsmi --type_data rs --loss mse --diagnosis_granularity coarse
+run rs_wsmi_mse_fine   "$DT"  $DEC --input_mode wsmi --type_data rs --loss mse --diagnosis_granularity fine
+run rs_wsmi_mse_coarse_ponly "$DT"  $DEC --input_mode wsmi --type_data rs --loss mse --diagnosis_granularity coarse --patients_only
+run rs_wsmi_mse_fine_ponly   "$DT"  $DEC --input_mode wsmi --type_data rs --loss mse --diagnosis_granularity fine   --patients_only
+run lg_wsmi_mse_coarse "$DT"  $DEC --input_mode wsmi --type_data lg --loss mse --diagnosis_granularity coarse --patients_only
+run lg_wsmi_mse_fine   "$DT"  $DEC --input_mode wsmi --type_data lg --loss mse --diagnosis_granularity fine   --patients_only
 
-# ---- GAE_VAE : MSE on wSMI, local-global WITH controls (drop --patients_only) ----
-run gaevae_lg_wsmi_mse_coarse_withctrl gae_vae  $GV --input_mode wsmi --type_data lg --loss mse --diagnosis_granularity coarse
-run gaevae_lg_wsmi_mse_fine_withctrl   gae_vae  $GV --input_mode wsmi --type_data lg --loss mse --diagnosis_granularity fine
+# ---- decoders : MSE on wSMI, local-global WITH controls (drop --patients_only) ----
+run lg_wsmi_mse_coarse_withctrl "$DT"  $DEC --input_mode wsmi --type_data lg --loss mse --diagnosis_granularity coarse
+run lg_wsmi_mse_fine_withctrl   "$DT"  $DEC --input_mode wsmi --type_data lg --loss mse --diagnosis_granularity fine
 
-# ---- GAE_VAE : MSE + corr on time-series (patients-only) ----
-run gaevae_rs_ts_corr_coarse  gae_vae  $GV --input_mode timeseries --type_data rs --loss mse_corr --diagnosis_granularity coarse --patients_only
-run gaevae_rs_ts_corr_fine    gae_vae  $GV --input_mode timeseries --type_data rs --loss mse_corr --diagnosis_granularity fine   --patients_only
-run gaevae_lg_ts_corr_coarse  gae_vae  $GV --input_mode timeseries --type_data lg --loss mse_corr --diagnosis_granularity coarse --patients_only
-run gaevae_lg_ts_corr_fine    gae_vae  $GV --input_mode timeseries --type_data lg --loss mse_corr --diagnosis_granularity fine   --patients_only
+# ---- decoders : MSE + corr on time-series (patients-only) ----
+run rs_ts_corr_coarse  "$DT"  $DEC --input_mode timeseries --type_data rs --loss mse_corr --diagnosis_granularity coarse --patients_only
+run rs_ts_corr_fine    "$DT"  $DEC --input_mode timeseries --type_data rs --loss mse_corr --diagnosis_granularity fine   --patients_only
+run lg_ts_corr_coarse  "$DT"  $DEC --input_mode timeseries --type_data lg --loss mse_corr --diagnosis_granularity coarse --patients_only
+run lg_ts_corr_fine    "$DT"  $DEC --input_mode timeseries --type_data lg --loss mse_corr --diagnosis_granularity fine   --patients_only
 
-# ---- GAE_VAE : time-series, local-global WITH controls (drop --patients_only) ----
-run gaevae_lg_ts_corr_coarse_withctrl gae_vae  $GV --input_mode timeseries --type_data lg --loss mse_corr --diagnosis_granularity coarse
-run gaevae_lg_ts_corr_fine_withctrl   gae_vae  $GV --input_mode timeseries --type_data lg --loss mse_corr --diagnosis_granularity fine
+# ---- decoders : time-series, local-global WITH controls (drop --patients_only) ----
+run lg_ts_corr_coarse_withctrl "$DT"  $DEC --input_mode timeseries --type_data lg --loss mse_corr --diagnosis_granularity coarse
+run lg_ts_corr_fine_withctrl   "$DT"  $DEC --input_mode timeseries --type_data lg --loss mse_corr --diagnosis_granularity fine
 
 # ---- enc_gae_fc / CEBRA : local-global, patients-only ----
 run cebra_lg_coarse  enc_gae_fc  $CB --input_mode timeseries --type_data lg --diagnosis_granularity coarse --patients_only
@@ -159,6 +170,7 @@ run cebra_rs_fine_ponly    enc_gae_fc  $CB --input_mode timeseries --type_data r
 # ---- enc_gae_fc / CEBRA : resting-state WITH controls (drop --patients_only) ----
 run cebra_rs_coarse_withctrl  enc_gae_fc  $CB --input_mode timeseries --type_data rs --diagnosis_granularity coarse
 run cebra_rs_fine_withctrl    enc_gae_fc  $CB --input_mode timeseries --type_data rs --diagnosis_granularity fine
+
 
 echo "=================================================================="
 echo "All runs dispatched. Outputs under $OUT_ROOT/<run_name>/"
