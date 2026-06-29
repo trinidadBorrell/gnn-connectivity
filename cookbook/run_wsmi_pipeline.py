@@ -113,8 +113,57 @@ def _data_variant(type_data: str, rs_duration: str) -> str:
 
 
 def _is_encoder_loss(loss: str) -> bool:
-    """The cebra loss drives the encoder-only (enc_gae_fc) path."""
+    """The cebra loss drives the encoder-only (enc_gae_fc / enc_gat_fc) path."""
     return loss == "cebra"
+
+
+# Encoder-only contrastive models (no decoder; trained with InfoNCE).
+ENCODER_MODELS = ("enc_gae_fc", "enc_gat_fc")
+
+
+def _is_encoder_model(model_kind: str) -> bool:
+    return model_kind in ENCODER_MODELS
+
+
+def _loader_workers(device, requested: int) -> int:
+    """num_workers safe for the device: 0 on MPS (multiprocessing+MPS deadlocks)."""
+    if getattr(device, "type", None) == "mps":
+        return 0
+    return max(0, int(requested))
+
+
+def _subsample_for_tune(graphs, cap, seed):
+    """Random seeded subsample of `graphs` to at most `cap` items (tune-only)."""
+    if not cap or len(graphs) <= cap:
+        return graphs
+    rng = np.random.default_rng(seed)
+    idx = rng.choice(len(graphs), size=cap, replace=False)
+    return [graphs[int(i)] for i in idx]
+
+
+def _subsample_recordings_for_tune(graphs, cap, seed):
+    """Subsample whole recordings up to ~`cap` graphs (tune-only).
+
+    Unlike _subsample_for_tune, keeps each recording's epochs contiguous so the
+    contrastive (ref, pos) temporal pairs survive — random per-graph sampling
+    would destroy the consecutive-epoch adjacency CebraPairDataset relies on.
+    """
+    if not cap or len(graphs) <= cap:
+        return graphs
+    from collections import defaultdict
+    rec = defaultdict(list)
+    for g in graphs:
+        key = (str(getattr(g, "subject_id", "")), str(getattr(g, "session_num", "")),
+               str(getattr(g, "acq", "")))
+        rec[key].append(g)
+    keys = list(rec.keys())
+    np.random.default_rng(seed).shuffle(keys)
+    out = []
+    for k in keys:
+        out.extend(rec[k])
+        if len(out) >= cap:
+            break
+    return out
 
 
 def set_seed(seed: int):
@@ -282,9 +331,19 @@ def stage_tune(args, out_root: str, data: dict, model_kind: str) -> Dict:
     os.makedirs(tune_dir, exist_ok=True)
 
     in_channels = data["train"][0].x.shape[1]
+    # Tune on a (capped) subset of TRAIN — hyperparameters transfer, and this is
+    # the single most expensive stage. Final train/test/cluster use ALL graphs.
+    tune_train = _subsample_for_tune(data["train"], args.tune_max_graphs, args.seed)
+    tune_val = _subsample_for_tune(
+        data["val"], (args.tune_max_graphs // 4 if args.tune_max_graphs else None),
+        args.seed + 1)
+    if args.tune_max_graphs:
+        print(f"  [tune {tag}] using capped subset: "
+              f"train {len(tune_train)}/{len(data['train'])}, "
+              f"val {len(tune_val)}/{len(data['val'])}")
     best_config, trials_df = run_ray_tune_wsmi(
-        train_graphs=data["train"],
-        val_graphs=data["val"],
+        train_graphs=tune_train,
+        val_graphs=tune_val,
         in_channels=in_channels,
         model_kind=model_kind,
         num_samples=args.num_trials,
@@ -294,6 +353,7 @@ def stage_tune(args, out_root: str, data: dict, model_kind: str) -> Dict:
         storage_path=os.path.join(tune_dir, "ray_results"),
         corr_lambda_search=(args.loss == "mse_corr"),
         max_concurrent_trials=args.max_concurrent_trials,
+        num_workers=args.num_workers,
     )
 
     # Persist trials and best config
@@ -366,7 +426,8 @@ def stage_train(args, out_root: str, data: dict, best: Dict, model_kind: str) ->
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(optim, mode="min", factor=0.5, patience=15)
     criterion = torch.nn.MSELoss()
     loader = PyGDataLoader(data["train"], batch_size=config["batch_size"],
-                           shuffle=True, num_workers=0, pin_memory=False)
+                           shuffle=True, pin_memory=False,
+                           num_workers=_loader_workers(device, args.num_workers))
 
     best_val = float("inf")
     best_state = None
@@ -520,7 +581,7 @@ def stage_test(args, out_root: str, model, config, data, model_kind: str) -> Dic
 
 def stage_latents_and_cluster(args, out_root: str, model, data, model_kind: str):
     tag = model_kind
-    is_encoder = (model_kind == "enc_gae_fc")
+    is_encoder = _is_encoder_model(model_kind)
     variational = _is_variational(model_kind)
     print(f"\n=== STAGE: LATENTS + CLUSTER ({tag}) ===")
     cluster_root = os.path.join(out_root, "clustering", tag)
@@ -636,7 +697,8 @@ def stage_latents_and_cluster(args, out_root: str, model, data, model_kind: str)
 # ---------------- enc_gae_fc + cebra (contrastive) path ----------------
 
 
-def _build_cebra_config(args, in_channels: int, overrides: Optional[Dict] = None) -> Dict:
+def _build_cebra_config(args, in_channels: int, model_kind: str = "enc_gae_fc",
+                        overrides: Optional[Dict] = None) -> Dict:
     config = {
         "in_channels": in_channels,
         "hidden_dims": [64, 64, 32, 16],
@@ -645,7 +707,7 @@ def _build_cebra_config(args, in_channels: int, overrides: Optional[Dict] = None
         "lr": args.cebra_lr,
         "weight_decay": args.cebra_weight_decay,
         "batch_size": args.cebra_batch_size,
-        "model_kind": "enc_gae_fc",
+        "model_kind": model_kind,
         "loss": "cebra",
         "temperature": args.cebra_temperature,
         "min_temp": args.cebra_min_temp,
@@ -656,15 +718,15 @@ def _build_cebra_config(args, in_channels: int, overrides: Optional[Dict] = None
     return config
 
 
-def stage_tune_cebra(args, out_root: str, data: dict) -> Dict:
-    """Lightweight grid search for enc_gae_fc/cebra (no Ray).
+def stage_tune_cebra(args, out_root: str, data: dict, model_kind: str = "enc_gae_fc") -> Dict:
+    """Lightweight grid search for an encoder/cebra model (no Ray).
 
     Sweeps temperature x lr x latent_dim, trains a few epochs on the train pairs,
     scores val InfoNCE, and returns the best {temperature, lr, latent_dim}.
     """
     from itertools import product
     from torch.utils.data import DataLoader as TorchDataLoader
-    tag = "enc_gae_fc"
+    tag = model_kind
     print(f"\n=== STAGE: TUNE ({tag}, cebra grid) ===")
     tune_dir = os.path.join(out_root, "tuning", tag)
     os.makedirs(tune_dir, exist_ok=True)
@@ -672,15 +734,24 @@ def stage_tune_cebra(args, out_root: str, data: dict) -> Dict:
     in_channels = data["train"][0].x.shape[1]
     bs = args.cebra_batch_size
 
-    train_ds = CebraPairDataset(data["train"])
-    val_ds = CebraPairDataset(data["val"])
+    # Tune on a capped subset (whole recordings, to keep temporal pairs intact).
+    tune_train = _subsample_recordings_for_tune(data["train"], args.tune_max_graphs, args.seed)
+    tune_val = _subsample_recordings_for_tune(
+        data["val"], (args.tune_max_graphs // 4 if args.tune_max_graphs else None),
+        args.seed + 1)
+    if args.tune_max_graphs:
+        print(f"  [cebra-tune] capped subset: train {len(tune_train)}/{len(data['train'])}, "
+              f"val {len(tune_val)}/{len(data['val'])}")
+    train_ds = CebraPairDataset(tune_train)
+    val_ds = CebraPairDataset(tune_val)
     if len(train_ds) == 0 or len(val_ds) == 0:
         print("  [cebra-tune] not enough pairs; falling back to defaults")
         return {}
+    nw = _loader_workers(device, args.num_workers)
     train_loader = TorchDataLoader(train_ds, batch_size=bs, shuffle=True,
-                                   collate_fn=collate_pairs)
+                                   collate_fn=collate_pairs, num_workers=nw)
     val_loader = TorchDataLoader(val_ds, batch_size=bs, shuffle=False,
-                                 collate_fn=collate_pairs)
+                                 collate_fn=collate_pairs, num_workers=nw)
 
     grid = list(product(args.cebra_tune_temperatures, args.cebra_tune_lrs,
                         args.cebra_tune_latent_dims))
@@ -689,8 +760,9 @@ def stage_tune_cebra(args, out_root: str, data: dict) -> Dict:
     best_val = float("inf")
     for temp, lr, ld in grid:
         set_seed(args.seed)
-        model = GNNEncoder(in_channels=in_channels, hidden_dims=[64, 64, 32, 16],
-                           latent_dim=ld, dropout=args.cebra_dropout).to(device)
+        model = build_decoder_model(model_kind, in_channels, {
+            "hidden_dims": [64, 64, 32, 16], "latent_dim": ld,
+            "dropout": args.cebra_dropout}).to(device)
         criterion = InfoNCE(temperature=temp, learn_temperature=not args.cebra_fixed_temp,
                             min_temp=args.cebra_min_temp).to(device)
         params = list(model.parameters()) + list(criterion.parameters())
@@ -737,17 +809,19 @@ def _cebra_eval(model, criterion, loader, device):
     return tot_loss / n, tot_align / n
 
 
-def stage_train_cebra(args, out_root: str, data: dict, overrides: Optional[Dict] = None
+def stage_train_cebra(args, out_root: str, data: dict, overrides: Optional[Dict] = None,
+                      model_kind: str = "enc_gae_fc"
                       ) -> Tuple[torch.nn.Module, Dict]:
     from torch.utils.data import DataLoader as TorchDataLoader
-    tag = "enc_gae_fc"
+    tag = model_kind
     print(f"\n=== STAGE: TRAIN FINAL ({tag}, cebra/InfoNCE) ===")
     model_dir = os.path.join(out_root, "models", tag)
     os.makedirs(model_dir, exist_ok=True)
 
     device = select_device(prefer_gpu=not args.cpu)
     in_channels = data["train"][0].x.shape[1]
-    config = _build_cebra_config(args, in_channels, overrides=overrides)
+    config = _build_cebra_config(args, in_channels, model_kind=model_kind,
+                                 overrides=overrides)
     set_seed(args.seed)
 
     train_ds = CebraPairDataset(data["train"])
@@ -757,16 +831,15 @@ def stage_train_cebra(args, out_root: str, data: dict, overrides: Optional[Dict]
             "no temporal (ref, pos) pairs in TRAIN — every recording has < 2 "
             "epochs, so the time-contrastive loss has nothing to contrast.")
     print(f"  contrastive pairs: train={len(train_ds)} val={len(val_ds)}")
+    nw = _loader_workers(device, args.num_workers)
     train_loader = TorchDataLoader(
         train_ds, batch_size=config["batch_size"], shuffle=True,
-        collate_fn=collate_pairs, num_workers=0)
+        collate_fn=collate_pairs, num_workers=nw)
     val_loader = TorchDataLoader(
         val_ds, batch_size=config["batch_size"], shuffle=False,
-        collate_fn=collate_pairs, num_workers=0)
+        collate_fn=collate_pairs, num_workers=nw)
 
-    model = GNNEncoder(
-        in_channels=config["in_channels"], hidden_dims=config["hidden_dims"],
-        latent_dim=config["latent_dim"], dropout=config["dropout"]).to(device)
+    model = build_decoder_model(model_kind, config["in_channels"], config).to(device)
     criterion = InfoNCE(
         temperature=config["temperature"],
         learn_temperature=config["learn_temperature"],
@@ -834,7 +907,7 @@ def stage_train_cebra(args, out_root: str, data: dict, overrides: Optional[Dict]
     ax.plot(history["train"], label="train", linewidth=1.5)
     ax.plot(history["val"], label="val", linewidth=1.5)
     ax.axvline(best_epoch, linestyle="--", color="grey", label=f"best ep={best_epoch}")
-    ax.set_title("enc_gae_fc InfoNCE (contrastive) loss")
+    ax.set_title(f"{tag} InfoNCE (contrastive) loss")
     ax.set_xlabel("epoch")
     ax.set_ylabel("InfoNCE loss")
     ax2 = ax.twinx()
@@ -850,7 +923,7 @@ def stage_train_cebra(args, out_root: str, data: dict, overrides: Optional[Dict]
 
 def stage_test_cebra(args, out_root: str, model, config, data) -> Dict:
     from torch.utils.data import DataLoader as TorchDataLoader
-    tag = "enc_gae_fc"
+    tag = config.get("model_kind", "enc_gae_fc")
     print(f"\n=== STAGE: TEST (held-out, one-shot) ({tag}, cebra) ===")
     test_dir = os.path.join(out_root, "final_test", tag)
     os.makedirs(test_dir, exist_ok=True)
@@ -924,12 +997,23 @@ def main():
                              "(default: Ray uses cpus/cpus_per_trial).")
     parser.add_argument("--train_epochs", type=int, default=150)
     parser.add_argument("--train_patience", type=int, default=25)
+    parser.add_argument("--tune_max_graphs", type=int, default=None,
+                        help="Cap the number of TRAIN graphs used during the tune "
+                             "stage only (random seeded subsample); val is capped to "
+                             "~1/4 of this. Final train/test/cluster still use ALL "
+                             "graphs. Hyperparameters transfer from a subset, so this "
+                             "cuts the most expensive stage without capping the run.")
+    parser.add_argument("--num_workers", type=int, default=4,
+                        help="DataLoader worker processes for train/tune loaders "
+                             "(forced to 0 on MPS, where multiprocessing + MPS "
+                             "tensors deadlock). Use >0 on CUDA/CPU nodes.")
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--stage", default="all",
                         choices=["load", "tune", "train", "test",
                                  "latents", "cluster", "all"])
     parser.add_argument("--models", nargs="+", default=["gae", "vgae"],
-                        choices=["gae", "vgae", "gae_vae", "gat_vae", "enc_gae_fc"])
+                        choices=["gae", "vgae", "gae_vae", "gat_vae",
+                                 "enc_gae_fc", "enc_gat_fc"])
     parser.add_argument("--input_mode", default="wsmi",
                         choices=["wsmi", "timeseries"],
                         help="Node-feature modality: pre-computed wSMI matrices "
@@ -1056,15 +1140,17 @@ def main():
         args.timeseries_control_dir = join(d["ts_control"])
 
     # --- loss/model compatibility ---
-    decoder_models = {"gae", "vgae", "gae_vae"}
+    decoder_models = {"gae", "vgae", "gae_vae", "gat_vae"}
     if args.loss == "cebra":
-        bad = [m for m in args.models if m != "enc_gae_fc"]
+        bad = [m for m in args.models if not _is_encoder_model(m)]
         if bad:
-            parser.error(f"--loss cebra requires --models enc_gae_fc; got {bad}")
+            parser.error("--loss cebra requires --models in "
+                         f"{list(ENCODER_MODELS)}; got {bad}")
     else:
-        if "enc_gae_fc" in args.models:
-            parser.error("--models enc_gae_fc requires --loss cebra "
-                         "(it is encoder-only, no reconstruction for MSE)")
+        enc = [m for m in args.models if _is_encoder_model(m)]
+        if enc:
+            parser.error(f"--models {enc} are encoder-only and require --loss cebra "
+                         "(no reconstruction for MSE)")
     # --loss mse_corr works in BOTH input modes. On timeseries the Pearson
     # regularizer preserves cross-electrode covariance over the time window; on
     # wsmi it preserves the row-correlation structure of the 64x64 matrix
@@ -1122,7 +1208,7 @@ def main():
         elif args.stage in ("tune", "all"):
             if cebra_path:
                 if args.cebra_tune:
-                    best = stage_tune_cebra(args, out_root, data)
+                    best = stage_tune_cebra(args, out_root, data, model_kind)
             else:
                 best = stage_tune(args, out_root, data, model_kind)
         else:
@@ -1135,7 +1221,8 @@ def main():
 
         if args.stage in ("train", "all"):
             if cebra_path:
-                model, config = stage_train_cebra(args, out_root, data, overrides=best)
+                model, config = stage_train_cebra(args, out_root, data, overrides=best,
+                                                  model_kind=model_kind)
             else:
                 if best is None:
                     raise RuntimeError(f"No best config found for {tag} - run --stage tune first")

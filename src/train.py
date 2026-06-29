@@ -26,14 +26,14 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import os
 from datetime import datetime
-from model import GAE, GAEVAE, GATVAE, VGAE, GNNEncoder, kl_divergence
+from model import GAE, GAEVAE, GATVAE, VGAE, GNNEncoder, GATEncoder, kl_divergence
 from correlation_loss import corr_loss
 
 
 def _select_model_class(model_kind: str):
     """Map a model_kind string to its class. Raises on unknown values."""
     table = {"gae": GAE, "vgae": VGAE, "gae_vae": GAEVAE, "gat_vae": GATVAE,
-             "enc_gae_fc": GNNEncoder}
+             "enc_gae_fc": GNNEncoder, "enc_gat_fc": GATEncoder}
     try:
         return table[model_kind]
     except KeyError:
@@ -59,7 +59,7 @@ def build_decoder_model(model_kind, in_channels, config):
         latent_dim=config["latent_dim"],
         dropout=config["dropout"],
     )
-    if model_kind == "gat_vae" and config.get("heads") is not None:
+    if model_kind in ("gat_vae", "enc_gat_fc") and config.get("heads") is not None:
         kwargs["heads"] = config["heads"]
     return ModelCls(in_channels, **kwargs)
 
@@ -376,7 +376,7 @@ def ray_trainable_wsmi(config, train_graphs=None, val_graphs=None):
     criterion = torch.nn.MSELoss()
 
     loader = PyGDataLoader(train_graphs, batch_size=batch_size,
-                           shuffle=True, num_workers=0)
+                           shuffle=True, num_workers=config.get("num_workers", 0))
 
     for epoch in range(n_epochs):
         if variational:
@@ -402,7 +402,8 @@ def ray_trainable_wsmi(config, train_graphs=None, val_graphs=None):
 
 def random_search_wsmi(train_graphs, val_graphs, in_channels,
                        model_kind="gae", num_samples=20, n_epochs=80,
-                       corr_lambda_search=False, seed=0, reduction_factor=3):
+                       corr_lambda_search=False, seed=0, reduction_factor=3,
+                       num_workers=0):
     """Ray-free hyperparameter search over the SAME space as run_ray_tune_wsmi.
 
     Used as a fallback when Ray is not installed (e.g. the ppc64le env, which has
@@ -469,7 +470,7 @@ def random_search_wsmi(train_graphs, val_graphs, in_channels,
             "opt": torch.optim.AdamW(model.parameters(), lr=cfg["lr"],
                                      weight_decay=cfg["weight_decay"]),
             "loader": PyGDataLoader(train_graphs, batch_size=cfg["batch_size"],
-                                    shuffle=True, num_workers=0),
+                                    shuffle=True, num_workers=num_workers),
             "epochs": 0, "best": float("inf"),
         })
 
@@ -516,7 +517,7 @@ def run_ray_tune_wsmi(train_graphs, val_graphs, in_channels,
                       model_kind="gae", num_samples=20, n_epochs=80,
                       grace_period=10, cpus_per_trial=2,
                       storage_path=None, corr_lambda_search=False,
-                      max_concurrent_trials=None):
+                      max_concurrent_trials=None, num_workers=0):
     """Wider ASHA search for the wSMI / time-series pipeline.
 
     Args:
@@ -538,7 +539,7 @@ def run_ray_tune_wsmi(train_graphs, val_graphs, in_channels,
         return random_search_wsmi(
             train_graphs, val_graphs, in_channels, model_kind=model_kind,
             num_samples=num_samples, n_epochs=n_epochs,
-            corr_lambda_search=corr_lambda_search)
+            corr_lambda_search=corr_lambda_search, num_workers=num_workers)
 
     variational = _is_variational(model_kind)
 
@@ -561,6 +562,7 @@ def run_ray_tune_wsmi(train_graphs, val_graphs, in_channels,
         "weight_decay": tune.loguniform(1e-6, 1e-3),
         "n_epochs": n_epochs,
         "model_kind": model_kind,
+        "num_workers": num_workers,
         # kept for backward compat with callers that still read 'variational'
         "variational": variational,
     }

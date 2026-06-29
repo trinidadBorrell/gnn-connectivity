@@ -420,6 +420,74 @@ class GNNEncoder(torch.nn.Module):
         return z
 
 
+class GATEncoder(torch.nn.Module):
+    """
+    Attention-based encoder for contrastive (CEBRA-style) training.
+
+    Identical in structure to GNNEncoder — GraphSAGE/GAT encoder -> global mean
+    pool -> FC head -> L2-normalized embedding, no decoder, trained with InfoNCE —
+    but every graph-convolution layer is a multi-head GATv2Conv (learned attention
+    over the k-NN electrode neighbourhood) instead of a SAGEConv mean aggregator.
+    Heads are averaged (concat=False) so each layer's width stays hidden_dims[i].
+
+    forward(x, edge_index, batch) returns z of shape (num_graphs, latent_dim),
+    matching GNNEncoder so the cebra pipeline does not need to branch by class.
+    """
+    HEADS = 4
+
+    def __init__(self, in_channels, hidden_dims=None, latent_dim=2, dropout=0.2,
+                 heads=None):
+        super().__init__()
+        if hidden_dims is None:
+            hidden_dims = [64, 64, 32, 16]
+        self.hidden_dims = hidden_dims
+        self.latent_dim = latent_dim
+        self.dropout_p = dropout
+        h_att = int(heads) if heads is not None else self.HEADS
+        self.heads = h_att
+
+        # GATv2 encoder stack (same pattern as GNNEncoder.encode_nodes).
+        self.encoder_layers = nn.ModuleList()
+        self.encoder_norms = nn.ModuleList()
+        self.encoder_dropouts = nn.ModuleList()
+        prev = in_channels
+        for h in hidden_dims:
+            self.encoder_layers.append(
+                GATv2Conv(prev, h, heads=h_att, concat=False, dropout=dropout))
+            self.encoder_norms.append(nn.BatchNorm1d(h))
+            self.encoder_dropouts.append(nn.Dropout(dropout))
+            prev = h
+
+        # Fully-connected projection head: pooled hidden -> latent_dim.
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dims[-1], hidden_dims[-1]),
+            nn.LeakyReLU(negative_slope=0.1),
+            nn.Linear(hidden_dims[-1], latent_dim),
+        )
+
+        print(f"GATEncoder Architecture: {in_channels} -> {hidden_dims} "
+              f"(GATv2 x{h_att} heads) -> meanpool -> "
+              f"[FC {hidden_dims[-1]}->{hidden_dims[-1]}->{latent_dim}] "
+              f"-> L2-norm (latent_dim={latent_dim})")
+
+    def encode_nodes(self, x, edge_index):
+        for conv, norm, drop in zip(self.encoder_layers, self.encoder_norms, self.encoder_dropouts):
+            x = conv(x, edge_index)
+            x = norm(x)
+            x = F.leaky_relu(x, negative_slope=0.1)
+            x = drop(x)
+        return x
+
+    def forward(self, x, edge_index, batch=None):
+        h = self.encode_nodes(x, edge_index)
+        if batch is None:
+            batch = x.new_zeros(x.size(0), dtype=torch.long)
+        pooled = global_mean_pool(h, batch)
+        z = self.head(pooled)
+        z = F.normalize(z, p=2, dim=-1)
+        return z
+
+
 class GAESimple(torch.nn.Module):
     """
     Original simple Graph Autoencoder with 2 layers.

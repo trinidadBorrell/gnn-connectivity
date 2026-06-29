@@ -29,12 +29,12 @@ import pandas as pd
 import torch
 
 # Local import resolves once src/ is on sys.path (as in cookbook/run_wsmi_pipeline.py).
-from model import GAEVAE, VGAE, kl_divergence  # noqa: E402
+from model import GAEVAE, GATVAE, VGAE, kl_divergence  # noqa: E402
 
 # Both VGAE and GAEVAE expose .encode() returning (mu, log_var) and forward()
 # returning (x_recon, z, mu, log_var). Any function operating on those outputs
 # accepts either class.
-VARIATIONAL_CLASSES = (VGAE, GAEVAE)
+VARIATIONAL_CLASSES = (VGAE, GAEVAE, GATVAE)
 
 
 @torch.no_grad()
@@ -150,7 +150,7 @@ def kl_per_dim(
     Returns a 1D array of length latent_dim.
     """
     if not isinstance(model, VARIATIONAL_CLASSES):
-        raise ValueError("kl_per_dim requires a variational model (VGAE/GAEVAE); got "
+        raise ValueError("kl_per_dim requires a variational model (VGAE/GAEVAE/GATVAE); got "
                          + type(model).__name__)
     device = device or torch.device("cpu")
     mu, log_var = _vgae_mu_logvar(model, graphs, device, batch_size=batch_size)
@@ -192,7 +192,7 @@ def mu_logvar_stats(
 ) -> pd.DataFrame:
     """Per-dim mean/std of mu and mean of log_var across graphs."""
     if not isinstance(model, VARIATIONAL_CLASSES):
-        raise ValueError("mu_logvar_stats requires a variational model (VGAE/GAEVAE); got "
+        raise ValueError("mu_logvar_stats requires a variational model (VGAE/GAEVAE/GATVAE); got "
                          + type(model).__name__)
     device = device or torch.device("cpu")
     mu, log_var = _vgae_mu_logvar(model, graphs, device, batch_size=batch_size)
