@@ -1,12 +1,13 @@
 # GNN Connectivity Pipeline
 
 A Graph Neural Network (GNN) pipeline for EEG / connectivity analysis. Trains
-a graph autoencoder on per-epoch biosemi64 graphs, supports two input
-modalities (pre-computed **wSMI** connectivity matrices or **raw per-electrode
-time-series**), three model architectures (**GAE**, **VGAE**, **GAEVAE**),
-**Ray Tune ASHA** hyperparameter search, **stratified subject-level splits**,
-and a full downstream suite of clustering, LOSO decoding, and latent-space
-diagnostics — all from a single entry point.
+a graph autoencoder (or a contrastive encoder) on per-epoch biosemi64 graphs,
+supports two input modalities (pre-computed **wSMI** connectivity matrices or
+**raw per-electrode time-series**), four model architectures (**GAE**, **VGAE**,
+**GAEVAE**, **enc_gae_fc**), three training objectives (**mse**, **mse_corr**,
+**cebra**/InfoNCE), **Ray Tune ASHA** hyperparameter search, **stratified
+subject-level splits**, and a full downstream suite of clustering, LOSO decoding,
+and latent-space diagnostics — all from a single entry point.
 
 The canonical entry point is [cookbook/run_wsmi_pipeline.py](cookbook/run_wsmi_pipeline.py).
 The older [cookbook/run_pipeline.py](cookbook/run_pipeline.py) is kept for
@@ -26,18 +27,28 @@ Every dimension of variation lives behind one CLI flag. Combine them freely.
 |---|---|---|---|
 | Input modality | `--input_mode` | `wsmi`, `timeseries` | `wsmi` |
 | Task | `--type_data` | `rs`, `lg` | `rs` |
-| Model architecture | `--models` | any subset of `gae`, `vgae`, `gae_vae` | `gae vgae` |
-| Cohort | `--patients_only` | flag (omit → controls included, **lg now supported**) | off |
+| RS window | `--rs_duration` | `0.8s`, `16s` (rs only; lg is always 0.8 s) | `0.8s` |
+| Model architecture | `--models` | any subset of `gae`, `vgae`, `gae_vae`; **or** `enc_gae_fc` (alone, with `--loss cebra`) | `gae vgae` |
+| Training objective | `--loss` | `mse`, `mse_corr`, `cebra` | `mse` |
+| Label granularity | `--diagnosis_granularity` | `coarse` (CONTROL/UWS/MCS), `fine` (raw `diagnostic_crs_final`) | `coarse` |
+| Cohort | `--patients_only` | flag (omit → controls included, **lg supported**) | off |
+| Data root | `--data_root` | prefix joined onto the per-variant `DATA_DEFAULTS` subpaths | `data` |
 | Correlation regularizer | `--lambda_corr` | float, `None` = use tuned value | `None` |
 | Time-series window | `--window_sec` | seconds | `16.0` |
 | Time-series sampling rate | `--sfreq` | Hz | `100.0` |
 | Stage | `--stage` | `load`, `tune`, `train`, `test`, `latents`, `cluster`, `all` | `all` |
 
+`--loss` is coupled to `--models`: `mse`/`mse_corr` need a **decoder**
+(`gae`/`vgae`/`gae_vae`); `cebra` needs the **encoder-only** `enc_gae_fc`. Both
+`mse_corr` and `cebra` run in either input modality (wsmi or timeseries).
+
 ## Run recipes
 
-All commands are runnable from the **repository root**
-(`Documents/Work/PhD/Proyects/GNNs`). Substitute `python` for
-`gnn_connectivity/.venv/bin/python` if you're using a different env.
+All commands are runnable from the **repository root** (the directory that
+contains both `gnn_connectivity/` and `data/`). Substitute `python` for
+`gnn_connectivity/.venv/bin/python` if you're using a different env. On the
+cluster, point `--data_root` / `--output_root` at the shared data trees instead
+of the repo-relative defaults (see the Condor section).
 
 **1. wSMI matrices, all subjects, GAE + VGAE** (most common):
 ```bash
@@ -115,6 +126,26 @@ MAX_EPOCHS=300 bash gnn_connectivity/cookbook/run_experiments.sh   # cap epochs/
 CPU=1 bash gnn_connectivity/cookbook/run_experiments.sh      # force CPU
 ```
 
+[cookbook/run_uncapped.sh](cookbook/run_uncapped.sh) is a variant that runs the
+matrix with no epoch cap (all windows of every recording).
+
+### Condor: one job per combination (168 jobs)
+
+For the cluster, [cookbook/condor/](cookbook/condor/) fans the **full** grid out
+to **one HTCondor job per combination** — architecture × data-variant
+(`rs08`/`rs16`/`lg`) × labels × cohort × input × loss, with the impossible
+`cebra ⟺ enc_gae_fc` couplings pruned (168 jobs). Generate the manifest, then
+submit:
+
+```bash
+python gnn_connectivity/cookbook/condor/gen_job_matrix.py
+condor_submit -dry-run:- gnn_connectivity/cookbook/condor/gnn_experiments.submit  # verify
+condor_submit gnn_connectivity/cookbook/condor/gnn_experiments.submit
+```
+
+Re-submission is resumable (a run with its `final_test/<arch>/test_report.json`
+is skipped). See [cookbook/condor/README.md](cookbook/condor/README.md).
+
 **7. Re-cluster an already-trained model** (skips load/tune/train):
 ```bash
 gnn_connectivity/.venv/bin/python gnn_connectivity/cookbook/run_wsmi_pipeline.py \
@@ -148,8 +179,15 @@ gnn_connectivity/.venv/bin/python gnn_connectivity/cookbook/run_wsmi_pipeline.py
 | `latents` | Re-extract latents and re-cluster without re-training (reads `models/<tag>/model.pt`). | same as `cluster` |
 | `all` | `load → tune → train → test → cluster` end-to-end. |
 
-`<tag>` is the model kind (`gae`, `vgae`, `gae_vae`) — runs that include
-multiple architectures get one subfolder per model.
+`<tag>` is the model kind (`gae`, `vgae`, `gae_vae`, `enc_gae_fc`) — runs that
+include multiple architectures get one subfolder per model.
+
+> **Tuning backend:** the decoder `tune` stage uses Ray Tune ASHA when Ray is
+> importable, and otherwise falls back automatically to a **Ray-free random
+> search** over the same search space (`random_search_wsmi` in
+> [src/train.py](src/train.py)) — useful on environments without Ray wheels
+> (e.g. ppc64le). The `enc_gae_fc`/`cebra` path uses its own lightweight grid
+> (`--cebra_tune`) and never needs Ray.
 
 All artifacts for one invocation land under `output/<run_name>/`.
 
@@ -165,6 +203,12 @@ All artifacts for one invocation land under `output/<run_name>/`.
   per-node MLP bottleneck `(mu, log_var)` between them. Cleanly separates
   "graph encoder" from "VAE encoder". Same loss as VGAE. See
   [src/model.py](src/model.py).
+- **enc_gae_fc** — **encoder-only** `GNNEncoder` (SAGEConv stack + FC head),
+  no decoder and no reconstruction. Emits one L2-normalized embedding per
+  epoch-graph, trained **contrastively** with the CEBRA/InfoNCE loss
+  (`--loss cebra`, the only loss it accepts). Selected by passing
+  `--models enc_gae_fc` alone. See [src/model.py](src/model.py) and
+  [src/cebra_loss.py](src/cebra_loss.py).
 
 ## Loss reference
 
@@ -173,55 +217,64 @@ Reconstruction (always):
 L_recon = MSE(x_recon, x)            [+ β · KL(q(z|x) || N(0,I))  if VGAE / GAEVAE]
 ```
 
-Time-series mode adds a **Pearson-correlation-preservation regularizer**:
+`--loss mse_corr` adds a **Pearson-correlation-preservation regularizer**:
 ```
 L = L_recon + λ_corr · MSE( corr(x_recon), corr(x) )
 ```
 where `corr(·)` is the per-graph channel × channel Pearson correlation matrix
-computed over the time dimension (see [src/correlation_loss.py](src/correlation_loss.py)).
-**Why this exists**: pure MSE on raw EEG burns capacity on the ~90 % of the
-variance that is noise. The correlation term forces cross-electrode
-covariance structure to be preserved in the reconstruction. Ray Tune searches
-`λ_corr ∈ [1e-2, 1e1]`; override at train stage with `--lambda_corr`.
+(see [src/correlation_loss.py](src/correlation_loss.py)). **Why this exists**: on
+raw time-series, pure MSE burns capacity on the ~90 % of the variance that is
+noise; the correlation term forces cross-electrode covariance structure to be
+preserved. It also runs on **wsmi** input (it then preserves the row-correlation
+structure of the 64×64 matrix). Ray Tune searches `λ_corr ∈ [1e-2, 1e1]` whenever
+`--loss mse_corr`; override at train stage with `--lambda_corr` (`0` disables it).
+
+`--loss cebra` (encoder-only `enc_gae_fc`) trains a **time-contrastive
+CEBRA/InfoNCE** objective instead of reconstruction (see
+[src/cebra_loss.py](src/cebra_loss.py)): the positive of epoch *i* is epoch *i+1*
+in the **same recording** (ordered by `matrix_idx`), negatives are the other
+positives in the batch, similarity is cosine over L2-normalized embeddings, and
+the temperature is optionally learnable. Tuned by a lightweight grid
+(`--cebra_tune`), not Ray Tune.
 
 ## Required data layout
 
-### wSMI matrices (`--input_mode wsmi`)
+Patient/control folders are resolved from `DATA_DEFAULTS` in
+[cookbook/run_wsmi_pipeline.py](cookbook/run_wsmi_pipeline.py), keyed by **data
+variant** (`--type_data` + `--rs_duration`): `rs_0.8s`, `rs_16s`, `lg`. The
+subpaths are joined onto `--data_root` (default `data`); explicit `--patient_dir`
+/ `--control_dir` / `--timeseries_patient_dir` / `--timeseries_control_dir`
+override them. lg is always 0.8 s, so `--rs_duration` is ignored there.
 
-Resting-state (`--type_data rs`, the default):
-```
-data/markers/wsmi_theta/nice_epochs_sfreq-100Hz_recombine-biosemi64_dur-16s/
-└── sub-<ID>/ses-<NN>/eeg/sub-<ID>_ses-<NN>_acq-<NN>_desc-wsmi_connectivity.pkl
+### wSMI matrices (`--input_mode wsmi`), subpaths under `<data_root>/`
 
-data/markers/wsmi_theta/control_bids_biosemi64_dur-16_tau10/  # optional with --patients_only
-└── sub-<NNN>/ses-<NN>/eeg/sub-<NNN>_ses-<NN>_acq-<NN>_desc-wsmi_connectivity.pkl
+| variant | patient | control (omit with `--patients_only`) |
+|---|---|---|
+| `rs_0.8s` | `markers/wsmi_theta/nice_epochs_sfreq-100Hz_recombine-biosemi64` | `markers/wsmi_theta/control_bids_biosemi64_tau10` |
+| `rs_16s` | `markers/wsmi_theta/nice_epochs_sfreq-100Hz_recombine-biosemi64_dur-16s` | `markers/wsmi_theta/control_bids_biosemi64_dur-16_tau10` |
+| `lg` | `markers/wsmi_theta_lg/nice_epochs_sfreq-100Hz_recombine-biosemi64_lg` | `markers/wsmi_theta_lg/control_bids_sfreq-100Hz_recombine-biosemi64-lg` |
 
-metadata/DoC_metadata/metadata_patient_labels.csv             # column: diagnostic_crs_final
-```
-
-Local-global (`--type_data lg`) — separate `wsmi_theta_lg/` tree, both cohorts at 100 Hz / tau=4:
-```
-data/markers/wsmi_theta_lg/nice_epochs_sfreq-100Hz_recombine-biosemi64_lg/        # DoC patients
-data/markers/wsmi_theta_lg/control_bids_sfreq-100Hz_recombine-biosemi64-lg/       # controls (omit with --patients_only)
-└── sub-<ID>/ses-<NN>/eeg/sub-<ID>_ses-<NN>_acq-<NN>_desc-wsmi_connectivity.pkl
-```
-The default dirs per `--type_data` live in `DATA_DEFAULTS` in
-[cookbook/run_wsmi_pipeline.py](cookbook/run_wsmi_pipeline.py); explicit `--patient_dir` / `--control_dir`
-override them. Control lg matrices are produced by recombining the EGI256 `controls-lg` source to
-biosemi64 and resampling to 100 Hz — see `preprocessing/01_recombine_egi256_to_biosemi64.py --task lg`
+Each tree: `sub-<ID>/ses-<NN>/eeg/sub-<ID>_ses-<NN>_acq-<NN>_desc-wsmi_connectivity.pkl`.
+Labels: `metadata/DoC_metadata/metadata_patient_labels.csv` (`diagnostic_crs_final`).
+Control lg matrices are recombined from the EGI256 `controls-lg` source to
+biosemi64 at 100 Hz / tau=4 — see `preprocessing/01_recombine_egi256_to_biosemi64.py --task lg`
 and `preprocessing/04_run_wsmi_theta.py`.
 
-### Time-series (`--input_mode timeseries`)
-```
-<timeseries_patient_dir>/
-└── sub-<ID>/ses-<NN>/eeg/sub-<ID>_ses-<NN>_task-<TASK>_acq-<NN>_epo.fif
+### Time-series (`--input_mode timeseries`), subpaths under `<data_root>/`
 
-<timeseries_control_dir>/                                     # optional with --patients_only
-└── sub-<NNN>/ses-<NN>/eeg/sub-<NNN>_ses-<NN>_task-<TASK>_acq-<NN>_epo.fif
-```
-Each `.fif` is read with MNE, resampled to `--sfreq` if needed, and cropped
-to the first `--window_sec * sfreq` samples per epoch. Resulting `Data.x` has
-shape `(64, window_sec * sfreq)` — e.g. `(64, 1600)` at the defaults.
+| variant | patient | control | window |
+|---|---|---|---|
+| `rs_0.8s` | `fif/pic-nic/nice_epochs_sfreq-100Hz_recombine-biosemi64` (task=rs) | `fif/pic-nic/control_bids_biosemi64-rs` | crop -0.2..0.6 s (80) |
+| `rs_16s` | `fif/pic-nic/nice_epochs_sfreq-100Hz_recombine-biosemi64_dur-16s` (task=rs) | `fif/pic-nic/control_bids_biosemi64_dur-16s-rs` | 16 s (1600) |
+| `lg` | `fif/pic-nic/nice_epochs_sfreq-100Hz_recombine-biosemi64` (task=lg) | `fif/pic-nic/control_bids_sfreq-100Hz_recombine-biosemi64-lg` | crop -0.2..0.6 s (80) |
+
+Each tree: `sub-<ID>/ses-<NN>/eeg/sub-<ID>_ses-<NN>_task-<TASK>_acq-<NN>_epo.fif`.
+The plain `nice_epochs_..._biosemi64` tree holds **both** rs and lg epochs — the
+loader's `task=` filter (driven by `--type_data`) selects the right ones. Each
+`.fif` is read with MNE, resampled to `--sfreq`, and either cropped to
+`[--crop_tmin, --crop_tmax]` (0.8 s variants) or sliced to the first
+`--window_sec * sfreq` samples (`rs_16s`). `Data.x` is `(64, 80)` for 0.8 s and
+`(64, 1600)` for 16 s.
 
 ### Subject / diagnosis mapping
 
@@ -244,16 +297,33 @@ the stratified split runs over `{UWS, MCS}`.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--stage` | `all` | Which stage to run (`load`/`tune`/`train`/`test`/`latents`/`cluster`/`all`). |
-| `--models` | `gae vgae` | Subset of `{gae, vgae, gae_vae}` — one tag per architecture trained. |
+| `--models` | `gae vgae` | Subset of `{gae, vgae, gae_vae}` (decoders, with `mse`/`mse_corr`), **or** `enc_gae_fc` alone (with `--loss cebra`). One tag per architecture. |
+| `--loss` | `mse` | Training objective: `mse`, `mse_corr` (decoders), or `cebra` (enc_gae_fc). |
 | `--input_mode` | `wsmi` | `wsmi` (pre-computed matrices) or `timeseries` (raw .fif). |
+| `--type_data` | `rs` | Task: `rs` (resting-state) or `lg` (local-global). Selects default dirs + task filter. |
+| `--rs_duration` | `0.8s` | RS window: `0.8s` (crop -0.2..0.6 s) or `16s` (full window). Ignored for `lg`. |
+| `--diagnosis_granularity` | `coarse` | `coarse` → CONTROL/UWS/MCS; `fine` → raw `diagnostic_crs_final` labels. |
 | `--patients_only` | off | Skip the control directory; train on DoC patients only. |
-| `--lambda_corr` | `None` | Override the Pearson-correlation regularizer weight at train stage. `None` → use Ray Tune's tuned value. `0` → disable. |
+| `--data_root` | `data` | Prefix joined onto the per-variant `DATA_DEFAULTS` subpaths. |
+| `--patient_dir` / `--control_dir` | — | Explicit wSMI roots (override `DATA_DEFAULTS`). |
+| `--timeseries_patient_dir` / `--timeseries_control_dir` | — | Explicit `.fif` roots (required for `timeseries` unless resolved from `DATA_DEFAULTS`; control optional with `--patients_only`). |
+| `--coords_file` | `…/biosemi64.txt` | Electrode coordinates file (k-NN adjacency). |
+| `--k` | `6` | k for the k-NN electrode adjacency graph. |
+| `--graph_latent_agg` | `flatten` | Per-graph latent: `flatten` (concat electrodes) or `mean` (average). Autoencoders only. |
+| `--lambda_corr` | `None` | Override the `mse_corr` weight at train stage. `None` → use Ray Tune's value. `0` → disable. |
+| `--crop_tmin` / `--crop_tmax` | `-0.2` / `0.6` | Timeseries crop window (s) for the 0.8 s variants. |
 | `--sfreq` | `100.0` | Target sampling rate (Hz) for time-series mode. |
-| `--window_sec` | `16.0` | Per-graph window length (s) for time-series mode. `x.shape == (n_channels, window_sec*sfreq)`. |
-| `--timeseries_patient_dir` / `--timeseries_control_dir` | — | Root of `.fif` epochs (required when `--input_mode=timeseries`; control dir optional with `--patients_only`). |
+| `--window_sec` | `16.0` | Per-graph window length (s) used when crop is disabled (`rs_16s`). |
+| `--filter_outliers` | off | Drop epochs that are Mahalanobis 2-sigma outliers under a Gaussian fit on TRAIN. |
+| `--outlier_n_sigma` / `--outlier_threshold` | `2.0` / `empirical` | Outlier boundary; `empirical` (TRAIN quantile) or `chi2`. |
+| `--subject_filter` | `None` | Restrict the load to a subset of subjects. |
+| `--max_epochs_per_recording` | `None` | Subsample epochs/recording (caps memory on big lg / rs_16s sets). |
 | `--num_trials` | `30` | Ray Tune ASHA samples per architecture. |
 | `--tune_epochs` | `80` | Max epochs per ASHA trial (`max_t`). |
-| `--cpus_per_trial` | `2` | CPU cores per Ray trial. |
+| `--cpus_per_trial` | `2` | CPU cores per Ray trial (tune stage is CPU-only). |
+| `--max_concurrent_trials` | `None` | Cap simultaneous Ray trials (peak RAM ≈ dataset·(1+N)). |
+| `--cebra_tune` | off | Run the lightweight enc_gae_fc/cebra grid (temperature/lr/latent_dim) before training. |
+| `--cebra_*` | see `--help` | enc_gae_fc/cebra hyperparameters (`--cebra_latent_dim`, `--cebra_lr`, `--cebra_temperature`, `--cebra_tune_*`, …). |
 | `--train_epochs` | `150` | Max epochs for final training. |
 | `--train_patience` | `25` | Early-stopping patience on val MSE. |
 | `--test_frac` / `--val_frac` | `0.15` / `0.15` | Subject-level split fractions (stratified on `diagnosis_group`). |
@@ -297,6 +367,7 @@ During the `cluster` stage the pipeline fits a KMeans on the latents
 | [scripts/render_wsmi_run_report.py](scripts/render_wsmi_run_report.py) | Render one combined HTML + TSV report for an `output/<run>/` directory: hyperparameter sweep, final test metrics, (model × clusterer) table, brain-state dynamics by diagnosis, LOSO decoder, reconstruction & latent diagnostics. |
 | [scripts/render_clustered_mean_matrices.py](scripts/render_clustered_mean_matrices.py) | Re-render each cluster's mean 64×64 wSMI matrix as an electrode-by-electrode heatmap in native electrode order. |
 | [scripts/convert_wsmi_pkl_to_npz.py](scripts/convert_wsmi_pkl_to_npz.py) | Optional `.pkl` → `.npz` converter. Not required; kept as utility. |
+| [scripts/add_prevalence_boxplots.py](scripts/add_prevalence_boxplots.py) | Re-render `prevalence_proportion_boxplots.png` (per-subject cluster proportions, ★ = group mean) from saved CSVs for existing runs — no retraining. |
 
 ### Typical run-then-report workflow
 
@@ -330,8 +401,11 @@ done
 
 | Module | Purpose |
 |---|---|
-| [src/model.py](src/model.py) | GAE, VGAE, GAEVAE — three graph autoencoder architectures. |
+| [src/model.py](src/model.py) | GAE, VGAE, GAEVAE autoencoders + `GNNEncoder` (enc_gae_fc) contrastive encoder. |
 | [src/train.py](src/train.py) | Training loop, MSE evaluation, Ray Tune ASHA wrapper. Honors `corr_lambda` and `model_kind`. |
+| [src/cebra_loss.py](src/cebra_loss.py) | CEBRA-style InfoNCE criterion + `CebraPairDataset` (temporal ref/pos pairs) for enc_gae_fc. |
+| [src/outlier_filter.py](src/outlier_filter.py) | Mahalanobis 2-sigma outlier model (fit on TRAIN, applied to all splits) for `--filter_outliers`. |
+| [src/analysis.py](src/analysis.py) | Standalone post-training latent cluster analysis (KMeans, per-cluster mean matrices, within-session Markov transitions, occupancy entropy). |
 | [src/wsmi_loader.py](src/wsmi_loader.py) | Read junifer wSMI `.pkl` outputs into per-epoch graphs; applies the CONTROL/UWS/MCS mapping. |
 | [src/timeseries_loader.py](src/timeseries_loader.py) | Read `.fif` epoch files into per-epoch graphs with raw time-series node features. |
 | [src/correlation_loss.py](src/correlation_loss.py) | Differentiable per-graph Pearson correlation matrix + `corr_loss`. |

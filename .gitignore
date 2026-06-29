@@ -17,3 +17,5 @@ clustering_results/
 logs/
 tests/
 output_old/
+cookbook/
+wsmi_res_control/

@@ -1,9 +1,10 @@
 """Backfill `prevalence_proportion_boxplots.png` for already-computed clustering dirs.
 
-Reads each clustering dir's `per_subject_within_cluster_share.csv` +
-`prevalence_counts.csv` and renders the new boxplot (per-subject within-cluster
-share, with the epoch-pooled prevalence_proportion = group-sum starred). Does NOT
-re-run the pipeline. Safe to run while the matrix is still going.
+Reads each clustering dir's `per_subject_cluster_proportions.csv` and re-renders
+the boxplot in the current style: per-subject cluster proportions (each in [0, 1])
+with the group MEAN marked as a ★, so the per-subject points spread around the
+marker. Does NOT re-run the pipeline — cheap, CSV-only. Safe to run while the
+matrix is still going (it overwrites the PNG in place).
 
 Usage:
   python gnn_connectivity/scripts/add_prevalence_boxplots.py [output_root]
@@ -27,25 +28,20 @@ from cluster_analysis import (  # noqa: E402
 
 def main():
     root = sys.argv[1] if len(sys.argv) > 1 else "gnn_connectivity/output"
-    share_csvs = glob.glob(
-        os.path.join(root, "*", "clustering", "*", "*", "per_subject_within_cluster_share.csv")
+    prop_csvs = glob.glob(
+        os.path.join(root, "*", "clustering", "*", "*", "per_subject_cluster_proportions.csv")
     )
     n_ok = 0
-    for share_path in sorted(share_csvs):
-        out_dir = os.path.dirname(share_path)
-        counts_path = os.path.join(out_dir, "prevalence_counts.csv")
-        if not os.path.exists(counts_path):
-            continue
+    for prop_path in sorted(prop_csvs):
+        out_dir = os.path.dirname(prop_path)
         try:
-            share_df = pd.read_csv(share_path)
-            counts = pd.read_csv(counts_path, index_col=0)
-            prevalence_prop = counts.div(counts.sum(axis=1).replace(0, 1), axis=0)
-            clusters = sorted(share_df["cluster"].unique().tolist())
+            prop_df = pd.read_csv(prop_path)
+            clusters = sorted(prop_df["cluster"].unique().tolist())
             name = "/".join(out_dir.split(os.sep)[-3:])
             plot_prevalence_proportion_boxplots(
-                share_df, prevalence_prop, clusters,
+                prop_df, clusters,
                 os.path.join(out_dir, "prevalence_proportion_boxplots.png"),
-                title=f"{name}: prevalence proportions (★) with per-subject spread",
+                title=f"{name}: per-subject cluster proportions (★ = group mean) by diagnosis",
             )
             # MATRIX-LEVEL occupancy P(cluster|diagnosis) from assignments.csv.
             assign_path = os.path.join(out_dir, "assignments.csv")

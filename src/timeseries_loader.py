@@ -312,6 +312,70 @@ def load_timeseries_dataset(
     return graphs, subject_ids, diagnosis_groups
 
 
+def attach_real_wsmi(
+    graphs,
+    wsmi_patient_dir: Optional[str],
+    wsmi_control_dir: Optional[str] = None,
+    verbose: bool = True,
+) -> Tuple[int, int]:
+    """Populate ``g.raw_matrix`` on time-series graphs with the matched real wSMI.
+
+    Time-series graphs do not store a connectivity matrix (to save RAM), so the
+    cluster summaries fall back to a Pearson correlation recomputed from the raw
+    voltage traces — a different, near-constant quantity that makes per-cluster
+    mean matrices look almost identical. This walks each graph back to the wSMI
+    epoch it was built from (via ``subject_id``/``session_num``/``acq`` ->
+    pkl path, then ``matrix_idx`` into the stack) and attaches the true 64x64
+    wSMI matrix as ``raw_matrix`` so ``cluster_mean_matrices`` averages real wSMI.
+
+    The lookup mirrors the loader: ``matrix_idx`` is the shared epoch index into
+    both the .fif epochs and the wSMI stack (aligned on the common prefix). Each
+    recording's stack is loaded once. Returns ``(n_attached, n_unmatched)``.
+    """
+    from collections import defaultdict
+
+    index: Dict[Tuple[str, str, str], str] = {}
+    index.update(_build_wsmi_path_index(wsmi_patient_dir))
+    if wsmi_control_dir:
+        index.update(_build_wsmi_path_index(wsmi_control_dir))
+    if not index:
+        if verbose:
+            print("[wsmi-attach] no wSMI directories given; nothing attached")
+        return 0, len(list(graphs))
+
+    by_rec: Dict[Tuple[str, str, str], list] = defaultdict(list)
+    for g in graphs:
+        key = (str(getattr(g, "subject_id", "")),
+               str(getattr(g, "session_num", "")),
+               str(getattr(g, "acq", "")))
+        by_rec[key].append(g)
+
+    n_ok = n_miss = 0
+    stack_cache: Dict[str, Optional[np.ndarray]] = {}
+    for key, recs in by_rec.items():
+        pkl = index.get(key)
+        if pkl is None:
+            n_miss += len(recs)
+            continue
+        if pkl not in stack_cache:
+            stack_cache[pkl] = _load_wsmi_stack(pkl)
+        stack = stack_cache[pkl]
+        if stack is None:
+            n_miss += len(recs)
+            continue
+        for g in recs:
+            idx = int(getattr(g, "matrix_idx", -1))
+            if 0 <= idx < stack.shape[0]:
+                g.raw_matrix = _symmetrize_and_clean(stack[idx])
+                n_ok += 1
+            else:
+                n_miss += 1
+    if verbose:
+        print(f"[wsmi-attach] attached real wSMI to {n_ok} graphs "
+              f"({n_miss} unmatched -> Pearson fallback)")
+    return n_ok, n_miss
+
+
 if __name__ == "__main__":
     import argparse
 

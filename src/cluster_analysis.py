@@ -606,36 +606,37 @@ def plot_cluster_proportion_boxplots(
 
 
 def plot_prevalence_proportion_boxplots(
-    share_df: pd.DataFrame, prevalence_prop: pd.DataFrame, clusters: Sequence[int],
+    prop_df: pd.DataFrame, clusters: Sequence[int],
     out_path: str, title: str = "",
     group_order: Optional[Sequence[str]] = None,
     group_colors: Optional[Dict[str, str]] = None,
+    value_col: str = "proportion",
 ):
-    """The `prevalence_proportions` numbers shown with per-subject spread.
+    """Per-subject cluster proportions with the group MEAN marked as a ★.
 
-    For a fixed cluster c, prevalence_proportion[c, g] = (#epochs of group g in c) /
-    (#epochs in c) = the SUM over group-g subjects of their within-cluster share[s, c].
-    So this plots, per cluster and per diagnosis group, the BOXPLOT of the per-subject
-    within-cluster shares (one point per subject), and marks the group's
-    prevalence_proportion (their sum) as a ★. Box = the per-subject pieces; ★ = the
-    single prevalence number. Boxes within a cluster sum (over all groups/subjects) to 1.
+    For each (cluster c, diagnosis group g) this boxplots the per-subject
+    proportions — proportion[s, c] = (#epochs of subject s in cluster c) /
+    (#epochs of subject s) — one point per subject, each in [0, 1]. The ★ sits at
+    the group MEAN of those per-subject proportions, so the points spread AROUND
+    the marker (unlike a sum, which the points could never surround).
 
-    `share_df`: columns subject_id, diagnosis_group, cluster, share.
-    `prevalence_prop`: rows 'cluster_<c>', columns = diagnosis groups, row-normalized
-        (each row sums to 1) — i.e. plot_prevalence(normalize=True)'s data.
+    `prop_df`: columns subject_id, diagnosis_group, cluster, `value_col`
+        (`proportion`, from per_subject_cluster_proportions). The overall
+        cluster composition (the prevalence numbers) is shown separately in
+        prevalence_proportions.png.
     """
     if group_order is None:
-        group_order = resolve_group_order(share_df["diagnosis_group"].tolist())
+        group_order = resolve_group_order(prop_df["diagnosis_group"].tolist())
     if group_colors is None:
         group_colors = resolve_group_colors(group_order)
-    groups = [g for g in group_order if g in set(share_df["diagnosis_group"])]
+    groups = [g for g in group_order if g in set(prop_df["diagnosis_group"])]
     clusters = list(clusters)
     centers, offsets, box_w = _grouped_cluster_positions(len(clusters), len(groups))
 
     fig, ax = plt.subplots(figsize=(max(7, 1.6 * len(clusters)), 5))
     for gi, g in enumerate(groups):
-        gdf = share_df[share_df["diagnosis_group"] == g]
-        data = [gdf[gdf["cluster"] == c]["share"].values for c in clusters]
+        gdf = prop_df[prop_df["diagnosis_group"] == g]
+        data = [gdf[gdf["cluster"] == c][value_col].values for c in clusters]
         positions = [centers[ci] + offsets[gi] for ci in range(len(clusters))]
         bp = ax.boxplot(data, positions=positions, widths=box_w * 0.9,
                         patch_artist=True, showmeans=False, manage_ticks=False)
@@ -650,16 +651,14 @@ def plot_prevalence_proportion_boxplots(
                 jitter = np.random.normal(0, box_w * 0.12, size=len(vals))
                 ax.scatter(np.full(len(vals), positions[ci]) + jitter, vals,
                            s=8, color="black", alpha=0.4, zorder=3)
-            # ★ at the prevalence_proportion (= sum of this group's shares in cluster c)
-            row = f"cluster_{c}"
-            if row in prevalence_prop.index and g in prevalence_prop.columns:
-                ax.scatter([positions[ci]], [float(prevalence_prop.loc[row, g])],
+                # ★ at the group MEAN of the per-subject proportions
+                ax.scatter([positions[ci]], [float(np.mean(vals))],
                            marker="*", s=170, color=group_colors.get(g, "#cccccc"),
                            edgecolor="black", linewidth=0.6, zorder=5)
     ax.set_xticks(centers)
     ax.set_xticklabels([str(c) for c in clusters])
     ax.set_xlabel("Cluster")
-    ax.set_ylabel("within-cluster share per subject  (★ = group sum = prevalence_proportion)")
+    ax.set_ylabel("per-subject proportion of epochs in cluster  (★ = group mean)")
     if title:
         ax.set_title(title)
     handles = [plt.Rectangle((0, 0), 1, 1, color=group_colors.get(g, "#cccccc"),
@@ -977,6 +976,48 @@ def save_metric_curve(curve: dict, out_path: str, kind: str):
     plt.close()
 
 
+def plot_latent_scatter(embeds: np.ndarray, labels: np.ndarray, name: str,
+                        out_dir: str) -> None:
+    """Save a 2D (latent_scatter.png) and a 3D (latent_scatter_3d.png) PCA scatter
+    of the latents, coloured by cluster. PCA is fit once to 3 components and the
+    2D plot reuses its first two, so both views share the same projection.
+    """
+    from sklearn.decomposition import PCA
+    X = np.asarray(embeds)
+    n_comp = min(3, X.shape[1])
+    Xp = PCA(n_components=n_comp, random_state=0).fit_transform(X) if X.shape[1] > 1 else X
+    # pad to >=3 cols so 2D/3D indexing is uniform for tiny latent dims
+    if Xp.shape[1] < 3:
+        Xp = np.column_stack([Xp, np.zeros((len(Xp), 3 - Xp.shape[1]))])
+
+    # 2D
+    fig, ax = plt.subplots(figsize=(7, 6))
+    sc = ax.scatter(Xp[:, 0], Xp[:, 1], c=labels, cmap="tab10", s=8, alpha=0.7)
+    ax.set_title(f"{name}: latent (PCA-2) coloured by cluster")
+    ax.set_xlabel("PC1")
+    ax.set_ylabel("PC2")
+    plt.colorbar(sc, ax=ax, label="cluster")
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "latent_scatter.png"),
+                dpi=200, bbox_inches="tight")
+    plt.close()
+
+    # 3D
+    fig = plt.figure(figsize=(8, 7))
+    ax = fig.add_subplot(111, projection="3d")
+    sc = ax.scatter(Xp[:, 0], Xp[:, 1], Xp[:, 2], c=labels, cmap="tab10",
+                    s=8, alpha=0.7, depthshade=True)
+    ax.set_title(f"{name}: latent (PCA-3) coloured by cluster")
+    ax.set_xlabel("PC1")
+    ax.set_ylabel("PC2")
+    ax.set_zlabel("PC3")
+    fig.colorbar(sc, ax=ax, label="cluster", shrink=0.6, pad=0.1)
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "latent_scatter_3d.png"),
+                dpi=200, bbox_inches="tight")
+    plt.close()
+
+
 def run_one_clusterer(
     name: str, labels: np.ndarray, bundle: LatentBundle, out_dir: str,
     electrode_labels: Optional[Sequence[str]], metric_curve: dict,
@@ -1042,13 +1083,13 @@ def run_one_clusterer(
         group_order=group_order, group_colors=group_colors,
         value_col="share",
         ylabel="Per-subject share of the cluster (sums to 1 within a cluster)")
-    #   Plot A3: the prevalence_proportions numbers, shown as per-subject share
-    #   boxplots with the prevalence (group sum) starred.
-    prevalence_prop = counts.div(counts.sum(axis=1).replace(0, 1), axis=0)
+    #   Plot A3: per-subject cluster proportions with the group MEAN starred, so
+    #   the per-subject points spread around the ★ (the overall prevalence numbers
+    #   live in prevalence_proportions.png).
     plot_prevalence_proportion_boxplots(
-        share_df, prevalence_prop, clusters,
+        prop_df, clusters,
         os.path.join(out_dir, "prevalence_proportion_boxplots.png"),
-        title=f"{name}: prevalence proportions (★) with per-subject spread",
+        title=f"{name}: per-subject cluster proportions (★ = group mean) by diagnosis",
         group_order=group_order, group_colors=group_colors)
     #   Plot B: per-group modal-cluster subject fractions (sum to 1 per group).
     frac_df = group_modal_cluster_fractions(
@@ -1083,24 +1124,9 @@ def run_one_clusterer(
     with open(os.path.join(out_dir, "metric_curve.json"), "w") as f:
         json.dump(metric_curve, f, indent=2, default=float)
 
-    # latent scatter (PCA-2)
+    # latent scatter (PCA-2 and PCA-3)
     try:
-        from sklearn.decomposition import PCA
-        X = bundle.embeds
-        if X.shape[1] > 2:
-            X2 = PCA(n_components=2, random_state=0).fit_transform(X)
-        else:
-            X2 = np.column_stack([X, np.zeros(len(X))]) if X.shape[1] == 1 else X
-        fig, ax = plt.subplots(figsize=(7, 6))
-        sc = ax.scatter(X2[:, 0], X2[:, 1], c=labels, cmap="tab10", s=8, alpha=0.7)
-        ax.set_title(f"{name}: latent (PCA-2) coloured by cluster")
-        ax.set_xlabel("PC1")
-        ax.set_ylabel("PC2")
-        plt.colorbar(sc, ax=ax, label="cluster")
-        plt.tight_layout()
-        plt.savefig(os.path.join(out_dir, "latent_scatter.png"),
-                    dpi=200, bbox_inches="tight")
-        plt.close()
+        plot_latent_scatter(bundle.embeds, labels, name, out_dir)
     except Exception as e:
         print(f"  [warn] scatter failed: {e}")
 

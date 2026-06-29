@@ -26,13 +26,14 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import os
 from datetime import datetime
-from model import GAE, GAEVAE, VGAE, GNNEncoder, kl_divergence
+from model import GAE, GAEVAE, GATVAE, VGAE, GNNEncoder, kl_divergence
 from correlation_loss import corr_loss
 
 
 def _select_model_class(model_kind: str):
     """Map a model_kind string to its class. Raises on unknown values."""
-    table = {"gae": GAE, "vgae": VGAE, "gae_vae": GAEVAE, "enc_gae_fc": GNNEncoder}
+    table = {"gae": GAE, "vgae": VGAE, "gae_vae": GAEVAE, "gat_vae": GATVAE,
+             "enc_gae_fc": GNNEncoder}
     try:
         return table[model_kind]
     except KeyError:
@@ -42,8 +43,25 @@ def _select_model_class(model_kind: str):
 
 
 def _is_variational(model_kind: str) -> bool:
-    """VGAE and GAEVAE both have a variational bottleneck (return mu/log_var)."""
-    return model_kind in ("vgae", "gae_vae")
+    """VGAE, GAEVAE and GATVAE all have a variational bottleneck (return mu/log_var)."""
+    return model_kind in ("vgae", "gae_vae", "gat_vae")
+
+
+def build_decoder_model(model_kind, in_channels, config):
+    """Instantiate a decoder/encoder model from a config dict.
+
+    Only gat_vae takes the extra ``heads`` attention hyperparameter; the other
+    classes share the (in_channels, hidden_dims, latent_dim, dropout) contract.
+    """
+    ModelCls = _select_model_class(model_kind)
+    kwargs = dict(
+        hidden_dims=config["hidden_dims"],
+        latent_dim=config["latent_dim"],
+        dropout=config["dropout"],
+    )
+    if model_kind == "gat_vae" and config.get("heads") is not None:
+        kwargs["heads"] = config["heads"]
+    return ModelCls(in_channels, **kwargs)
 
 try:
     import psutil
@@ -352,9 +370,7 @@ def ray_trainable_wsmi(config, train_graphs=None, val_graphs=None):
     kl_warmup_epochs = config.get("kl_warmup_epochs", 10)
     corr_lambda = config.get("corr_lambda", 0.0)
 
-    ModelCls = _select_model_class(model_kind)
-    model = ModelCls(in_channels, hidden_dims=hidden_dims,
-                     latent_dim=latent_dim, dropout=dropout)
+    model = build_decoder_model(model_kind, in_channels, config)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=lr, weight_decay=weight_decay)
     criterion = torch.nn.MSELoss()
@@ -384,6 +400,118 @@ def ray_trainable_wsmi(config, train_graphs=None, val_graphs=None):
         })
 
 
+def random_search_wsmi(train_graphs, val_graphs, in_channels,
+                       model_kind="gae", num_samples=20, n_epochs=80,
+                       corr_lambda_search=False, seed=0, reduction_factor=3):
+    """Ray-free hyperparameter search over the SAME space as run_ray_tune_wsmi.
+
+    Used as a fallback when Ray is not installed (e.g. the ppc64le env, which has
+    no Ray wheels). Draws `num_samples` random configs, trains each for
+    `n_epochs`, and keeps the one with the lowest best-epoch val MSE. Returns the
+    same `(best_config dict, trials_df)` contract as run_ray_tune_wsmi so the
+    caller (stage_tune) is unchanged.
+    """
+    import random as _random
+    import math as _math
+    import pandas as _pd
+    from torch_geometric.loader import DataLoader as PyGDataLoader
+
+    rng = _random.Random(seed)
+    variational = _is_variational(model_kind)
+    device = torch.device("cuda:0") if torch.cuda.is_available() else (
+        torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu"))
+
+    HIDDEN_CHOICES = [[64, 32], [64, 64, 32], [64, 64, 32, 16]]
+
+    def _loguniform(a, b):
+        return _math.exp(rng.uniform(_math.log(a), _math.log(b)))
+
+    def _sample():
+        cfg = {
+            "in_channels": in_channels,
+            "latent_dim": rng.choice([2, 4, 8, 16, 32]),
+            "hidden_dims": rng.choice(HIDDEN_CHOICES),
+            "lr": _loguniform(1e-4, 5e-3),
+            "dropout": rng.uniform(0.0, 0.4),
+            "batch_size": rng.choice([32, 64]),
+            "weight_decay": _loguniform(1e-6, 1e-3),
+            "n_epochs": n_epochs,
+            "model_kind": model_kind,
+            "variational": variational,
+        }
+        if variational:
+            cfg["beta_kl"] = rng.choice([0.001, 0.01, 0.1, 1.0])
+            cfg["kl_warmup_epochs"] = rng.choice([0, 10, 30])
+        if model_kind == "gat_vae":
+            cfg["heads"] = rng.choice([2, 4, 8])
+        if corr_lambda_search:
+            cfg["corr_lambda"] = _loguniform(1e-2, 1e1)
+        return cfg
+
+    # Multi-fidelity successive halving (ASHA-style): start all `num_samples`
+    # configs, train each for a short "rung" budget, keep the best 1/eta, give the
+    # survivors a larger budget, repeat. This gets the search breadth of
+    # `num_samples` at roughly the cost of a handful of full trainings — the key
+    # lever that made the un-pruned 30-trial search on the big datasets too slow.
+    eta = max(2, int(reduction_factor))
+    min_epochs = max(2, n_epochs // (eta * eta))   # smallest rung budget
+    criterion = torch.nn.MSELoss()
+
+    print(f"[tune {model_kind}] successive-halving: {num_samples} configs, "
+          f"eta={eta}, rung0={min_epochs} -> max {n_epochs} epochs on {device}")
+
+    states = []
+    for cfg in (_sample() for _ in range(num_samples)):
+        model = build_decoder_model(model_kind, in_channels, cfg).to(device)
+        states.append({
+            "cfg": cfg,
+            "model": model,
+            "opt": torch.optim.AdamW(model.parameters(), lr=cfg["lr"],
+                                     weight_decay=cfg["weight_decay"]),
+            "loader": PyGDataLoader(train_graphs, batch_size=cfg["batch_size"],
+                                    shuffle=True, num_workers=0),
+            "epochs": 0, "best": float("inf"),
+        })
+
+    def _train_to(st, budget):
+        cfg = st["cfg"]
+        beta_max = cfg.get("beta_kl", 1.0)
+        kl_warmup = cfg.get("kl_warmup_epochs", 10)
+        corr_lambda = cfg.get("corr_lambda", 0.0)
+        while st["epochs"] < budget:
+            ep = st["epochs"]
+            beta = beta_max * min(1.0, ep / max(1, kl_warmup)) if variational else 0.0
+            train_one_epoch(st["model"], st["opt"], criterion, st["loader"],
+                            device=device, variational=variational, beta=beta,
+                            corr_lambda=corr_lambda)
+            vm = float(compute_mse_on_graphs(st["model"], val_graphs, device=device,
+                                             variational=variational))
+            st["best"] = min(st["best"], vm)
+            st["epochs"] = ep + 1
+
+    alive, budget = states, min(min_epochs, n_epochs)
+    while True:
+        for st in alive:
+            _train_to(st, budget)
+        if budget >= n_epochs or len(alive) <= 1:
+            break
+        alive = sorted(alive, key=lambda s: s["best"])[:max(1, len(alive) // eta)]
+        budget = min(n_epochs, budget * eta)
+
+    rows = []
+    for i, st in enumerate(states):
+        row = {k: v for k, v in st["cfg"].items() if k != "in_channels"}
+        row.update(trial=i, val_mse=st["best"], epochs_trained=st["epochs"])
+        rows.append(row)
+    best_state = min(states, key=lambda s: s["best"])
+    best_cfg, best_mse = dict(best_state["cfg"]), best_state["best"]
+
+    best_cfg["val_mse"] = best_mse
+    print(f"\nBest config: {best_cfg}")
+    print(f"Best val MSE: {best_mse:.6f}")
+    return best_cfg, _pd.DataFrame(rows)
+
+
 def run_ray_tune_wsmi(train_graphs, val_graphs, in_channels,
                       model_kind="gae", num_samples=20, n_epochs=80,
                       grace_period=10, cpus_per_trial=2,
@@ -397,10 +525,20 @@ def run_ray_tune_wsmi(train_graphs, val_graphs, in_channels,
         corr_lambda_search: if True, tune the Pearson-correlation regularizer
             weight in the search space (use in time-series mode).
     Returns best config dict + analysis dataframe.
+
+    Falls back to a Ray-free random search (random_search_wsmi) when Ray is not
+    importable, so the pipeline runs on environments without Ray wheels.
     """
-    import ray
-    from ray import tune
-    from ray.tune.schedulers import ASHAScheduler
+    try:
+        import ray
+        from ray import tune
+        from ray.tune.schedulers import ASHAScheduler
+    except ImportError:
+        print("[tune] Ray not available -> Ray-free random-search fallback")
+        return random_search_wsmi(
+            train_graphs, val_graphs, in_channels, model_kind=model_kind,
+            num_samples=num_samples, n_epochs=n_epochs,
+            corr_lambda_search=corr_lambda_search)
 
     variational = _is_variational(model_kind)
 
@@ -429,6 +567,8 @@ def run_ray_tune_wsmi(train_graphs, val_graphs, in_channels,
     if variational:
         search_space["beta_kl"] = tune.choice([0.001, 0.01, 0.1, 1.0])
         search_space["kl_warmup_epochs"] = tune.choice([0, 10, 30])
+    if model_kind == "gat_vae":
+        search_space["heads"] = tune.choice([2, 4, 8])
     if corr_lambda_search:
         search_space["corr_lambda"] = tune.loguniform(1e-2, 1e1)
 

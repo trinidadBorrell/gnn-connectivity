@@ -18,7 +18,7 @@ This file only defines the model structure, doesn't handle data or training.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import SAGEConv, global_mean_pool
+from torch_geometric.nn import GATv2Conv, SAGEConv, global_mean_pool
 
 
 class GAE(torch.nn.Module):
@@ -227,6 +227,104 @@ class GAEVAE(torch.nn.Module):
             x = drop(x)
         mu_lv = self.vae_encoder(x)
         mu, log_var = mu_lv.chunk(2, dim=-1)
+        return mu, log_var
+
+    def reparameterize(self, mu, log_var):
+        if self.training:
+            std = torch.exp(0.5 * log_var)
+            eps = torch.randn_like(std)
+            return mu + eps * std
+        return mu
+
+    def decode(self, z, edge_index):
+        x = self.vae_decoder(z)
+        x = F.leaky_relu(x, negative_slope=0.1)
+        for conv, norm, drop in zip(self.decoder_layers[:-1], self.decoder_norms, self.decoder_dropouts):
+            x = conv(x, edge_index)
+            x = norm(x)
+            x = F.leaky_relu(x, negative_slope=0.1)
+            x = drop(x)
+        x = self.decoder_layers[-1](x, edge_index)
+        return x
+
+    def forward(self, x, edge_index):
+        mu, log_var = self.encode(x, edge_index)
+        z = self.reparameterize(mu, log_var)
+        x_recon = self.decode(z, edge_index)
+        return x_recon, z, mu, log_var
+
+
+class GATVAE(torch.nn.Module):
+    """
+    Attention-based variational graph autoencoder: a GATv2 message-passing
+    encoder + a per-node MLP VAE bottleneck + a GATv2 decoder.
+
+    Same structure as GAEVAE, but every graph-convolution layer is a multi-head
+    GATv2Conv (learned attention over the k-NN electrode neighbourhood) instead of
+    a SAGEConv mean aggregator. Attention heads are averaged (concat=False) so each
+    layer's output width stays hidden_dims[i] and the rest of the plumbing (config
+    keys, BatchNorm, decoder mirror) is unchanged.
+
+    forward returns (x_recon, z, mu, log_var) matching VGAE/GAEVAE so the training
+    loop and _is_variational handling do not need a new branch. The constructor
+    signature matches the other models (in_channels, hidden_dims, latent_dim,
+    dropout); the number of attention heads is fixed internally.
+    """
+    HEADS = 4
+
+    def __init__(self, in_channels, hidden_dims=None, latent_dim=2, dropout=0.2,
+                 heads=None):
+        super().__init__()
+        if hidden_dims is None:
+            hidden_dims = [64, 64, 32, 16]
+        self.hidden_dims = hidden_dims
+        self.latent_dim = latent_dim
+        self.dropout_p = dropout
+        h_att = int(heads) if heads is not None else self.HEADS
+        self.heads = h_att
+
+        # Graph encoder: in -> hd[0] -> ... -> hd[-1] (GATv2, heads averaged).
+        self.encoder_layers = nn.ModuleList()
+        self.encoder_norms = nn.ModuleList()
+        self.encoder_dropouts = nn.ModuleList()
+        prev = in_channels
+        for h in hidden_dims:
+            self.encoder_layers.append(
+                GATv2Conv(prev, h, heads=h_att, concat=False, dropout=dropout))
+            self.encoder_norms.append(nn.BatchNorm1d(h))
+            self.encoder_dropouts.append(nn.Dropout(dropout))
+            prev = h
+
+        # Per-node MLP VAE bottleneck (identical to GAEVAE).
+        self.vae_encoder = nn.Linear(hidden_dims[-1], 2 * latent_dim)
+        self.vae_decoder = nn.Linear(latent_dim, hidden_dims[-1])
+
+        # Graph decoder: hd[-1] -> ... -> hd[0] -> in_channels (GATv2).
+        decoder_dims = list(reversed(hidden_dims))
+        self.decoder_layers = nn.ModuleList()
+        self.decoder_norms = nn.ModuleList()
+        self.decoder_dropouts = nn.ModuleList()
+        prev = decoder_dims[0]
+        for h in decoder_dims[1:]:
+            self.decoder_layers.append(
+                GATv2Conv(prev, h, heads=h_att, concat=False, dropout=dropout))
+            self.decoder_norms.append(nn.BatchNorm1d(h))
+            self.decoder_dropouts.append(nn.Dropout(dropout))
+            prev = h
+        self.decoder_layers.append(
+            GATv2Conv(prev, in_channels, heads=h_att, concat=False, dropout=dropout))
+
+        print(f"GATVAE Architecture: {in_channels} -> {hidden_dims} (GATv2 x{h_att} heads) -> "
+              f"[MLP {hidden_dims[-1]}->2*{latent_dim}] -> {latent_dim} -> "
+              f"[MLP {latent_dim}->{hidden_dims[-1]}] -> {decoder_dims} -> {in_channels}")
+
+    def encode(self, x, edge_index):
+        for conv, norm, drop in zip(self.encoder_layers, self.encoder_norms, self.encoder_dropouts):
+            x = conv(x, edge_index)
+            x = norm(x)
+            x = F.leaky_relu(x, negative_slope=0.1)
+            x = drop(x)
+        mu, log_var = self.vae_encoder(x).chunk(2, dim=-1)
         return mu, log_var
 
     def reparameterize(self, mu, log_var):

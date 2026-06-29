@@ -36,12 +36,12 @@ if SRC_DIR not in sys.path:
 
 from model import GAE, GAEVAE, VGAE, GNNEncoder, kl_divergence  # noqa: E402
 from train import (  # noqa: E402
-    _is_variational, _select_model_class,
+    _is_variational, _select_model_class, build_decoder_model,
     apply_normalization, compute_mse_on_graphs,
     compute_normalization_stats, run_ray_tune_wsmi, train_one_epoch,
 )
 from wsmi_loader import load_wsmi_dataset  # noqa: E402
-from timeseries_loader import load_timeseries_dataset  # noqa: E402
+from timeseries_loader import load_timeseries_dataset, attach_real_wsmi  # noqa: E402
 from data_loaders import split_by_subject_stratified  # noqa: E402
 from outlier_filter import (  # noqa: E402
     apply_outlier_model, fit_outlier_model, summarize as summarize_outliers,
@@ -55,6 +55,7 @@ from cluster_analysis import (  # noqa: E402
 from state_dynamics import per_recording_dynamics, per_subject_aggregate, group_summary  # noqa: E402
 from decoder_eval import (  # noqa: E402
     aggregate_latents_per_subject, build_subject_feature_table, loso_decoder,
+    plot_decoder_performance,
 )
 from latent_diagnostics import (  # noqa: E402
     per_edge_reconstruction_error, per_subject_recon_mse,
@@ -62,32 +63,53 @@ from latent_diagnostics import (  # noqa: E402
 )
 
 
-# Default data/marker roots per --type_data. Filled into the dir flags in main()
-# only when the user leaves them unset, so explicit --*_dir overrides still win.
+# Default data/marker SUBPATHS per data variant, relative to --data_root
+# (default "data"). Filled into the dir flags in main() only when the user
+# leaves them unset, so explicit --*_dir overrides still win.
+#
+# A "variant" couples the task (--type_data) with the resting-state window
+# (--rs_duration): rs_0.8s, rs_16s, lg. Local-global is always 0.8 s, so
+# --rs_duration is ignored when --type_data=lg.
+#   - 0.8 s  -> timeseries cropped to [crop_tmin, crop_tmax] (-0.2..0.6 s, 80 samp)
+#   - 16 s   -> timeseries uses the full window (--window_sec 16 -> 1600 samp)
+# wSMI matrices are pre-computed, so the variant only selects the folder there.
+# The plain `nice_epochs_..._biosemi64` tree holds BOTH rs and lg epochs; the
+# loader's task= filter (timeseries) picks the right ones.
 DATA_DEFAULTS = {
-    "rs": {
-        "wsmi_patient": "data/markers/wsmi_theta/"
+    "rs_0.8s": {
+        "wsmi_patient": "markers/wsmi_theta/nice_epochs_sfreq-100Hz_recombine-biosemi64",
+        "wsmi_control": "markers/wsmi_theta/control_bids_biosemi64_tau10",
+        "ts_patient": "fif/pic-nic/nice_epochs_sfreq-100Hz_recombine-biosemi64",
+        "ts_control": "fif/pic-nic/control_bids_biosemi64-rs",
+    },
+    "rs_16s": {
+        "wsmi_patient": "markers/wsmi_theta/"
                         "nice_epochs_sfreq-100Hz_recombine-biosemi64_dur-16s",
-        "wsmi_control": "data/markers/wsmi_theta/control_bids_biosemi64_dur-16_tau10",
-        # task-rs .fif live in the same pic-nic root as lg; the task filter selects them.
-        "ts_patient": "data/fif/pic-nic/nice_epochs_sfreq-100Hz_recombine-biosemi64",
-        # Control rs time-series: biosemi64 controls (250 Hz; the loader resamples to
-        # --sfreq). Omitted when --patients_only is set. Epochs are cropped to
-        # [crop_tmin, crop_tmax] (-0.2..0.6 s) just like lg.
-        "ts_control": "data/fif/pic-nic/control_bids_biosemi64-rs",
+        "wsmi_control": "markers/wsmi_theta/control_bids_biosemi64_dur-16_tau10",
+        "ts_patient": "fif/pic-nic/nice_epochs_sfreq-100Hz_recombine-biosemi64_dur-16s",
+        "ts_control": "fif/pic-nic/control_bids_biosemi64_dur-16s-rs",
     },
     "lg": {
-        "wsmi_patient": "data/markers/wsmi_theta_lg/"
+        "wsmi_patient": "markers/wsmi_theta_lg/"
                         "nice_epochs_sfreq-100Hz_recombine-biosemi64_lg",
         # Healthy-control lg wSMI: EGI256 controls recombined to biosemi64 and
         # resampled to 100 Hz (tau=4), so it matches the patient lg config exactly.
-        # Omitted automatically when --patients_only is set.
-        "wsmi_control": "data/markers/wsmi_theta_lg/"
+        "wsmi_control": "markers/wsmi_theta_lg/"
                         "control_bids_sfreq-100Hz_recombine-biosemi64-lg",
-        "ts_patient": "data/fif/pic-nic/nice_epochs_sfreq-100Hz_recombine-biosemi64",
-        "ts_control": "data/fif/pic-nic/control_bids_sfreq-100Hz_recombine-biosemi64-lg",
+        "ts_patient": "fif/pic-nic/nice_epochs_sfreq-100Hz_recombine-biosemi64",
+        "ts_control": "fif/pic-nic/control_bids_sfreq-100Hz_recombine-biosemi64-lg",
     },
 }
+
+
+def _data_variant(type_data: str, rs_duration: str) -> str:
+    """Resolve the DATA_DEFAULTS key from --type_data + --rs_duration.
+
+    lg is always 0.8 s, so rs_duration is ignored there.
+    """
+    if type_data == "lg":
+        return "lg"
+    return f"rs_{rs_duration}"
 
 
 def _is_encoder_loss(loss: str) -> bool:
@@ -112,13 +134,8 @@ def select_device(prefer_gpu: bool = True) -> torch.device:
 
 
 def _build_model(model_kind: str, config: Dict) -> torch.nn.Module:
-    Cls = _select_model_class(model_kind)
-    return Cls(
-        in_channels=config["in_channels"],
-        hidden_dims=config["hidden_dims"],
-        latent_dim=config["latent_dim"],
-        dropout=config["dropout"],
-    )
+    # gat_vae additionally honors the searched `heads` attention hyperparameter.
+    return build_decoder_model(model_kind, config["in_channels"], config)
 
 
 # ---------------- stages ----------------
@@ -191,9 +208,13 @@ def stage_load(args, out_root: str) -> dict:
             seed=args.seed,
         )
     elif args.input_mode == "timeseries":
-        # Both rs and lg epochs span -0.2..0.6 s, so crop identically for both.
-        # The window is a property of the DATA (task), not the model.
-        crop = (args.crop_tmin, args.crop_tmax)
+        # rs_16s uses the full 16 s window (crop disabled -> window_sec slicing,
+        # 1600 samples). rs_0.8s and lg crop to [crop_tmin, crop_tmax]
+        # (-0.2..0.6 s, 80 samples). lg is always 0.8 s.
+        if args.type_data == "rs" and args.rs_duration == "16s":
+            crop = None
+        else:
+            crop = (args.crop_tmin, args.crop_tmax)
         # When filtering, attach the matched real wSMI (args.patient/control_dir
         # are the wSMI roots) as the Mahalanobis basis.
         wsmi_patient = args.patient_dir if args.filter_outliers else None
@@ -271,7 +292,7 @@ def stage_tune(args, out_root: str, data: dict, model_kind: str) -> Dict:
         grace_period=max(2, args.tune_epochs // 4),
         cpus_per_trial=args.cpus_per_trial,
         storage_path=os.path.join(tune_dir, "ray_results"),
-        corr_lambda_search=(args.input_mode == "timeseries"),
+        corr_lambda_search=(args.loss == "mse_corr"),
         max_concurrent_trials=args.max_concurrent_trials,
     )
 
@@ -512,6 +533,16 @@ def stage_latents_and_cluster(args, out_root: str, model, data, model_kind: str)
             all_graphs.append(g)
             splits.append(split_name)
 
+    # Time-series graphs carry no connectivity matrix, so per-cluster mean
+    # matrices would otherwise fall back to a near-constant Pearson correlation.
+    # Always walk each graph back to its real wSMI epoch so the mean matrices are
+    # true wSMI (opt out with --no_cluster_real_wsmi). No effect in wsmi mode.
+    if args.input_mode == "timeseries" and not args.no_cluster_real_wsmi:
+        attach_real_wsmi(
+            all_graphs, args.patient_dir,
+            None if args.patients_only else args.control_dir,
+        )
+
     device = next(model.parameters()).device
     if is_encoder:
         bundle = extract_embeddings_encoder(model, all_graphs, splits, device=device)
@@ -568,6 +599,7 @@ def stage_latents_and_cluster(args, out_root: str, model, data, model_kind: str)
         dec_metrics, dec_preds = loso_decoder(subject_table, label_col="diagnosis_group")
         dec_metrics.to_csv(os.path.join(metrics_root, "decoder_metrics.tsv"), sep="\t", index=False)
         dec_preds.to_csv(os.path.join(metrics_root, "decoder_predictions.tsv"), sep="\t", index=False)
+        plot_decoder_performance(dec_metrics, dec_preds, metrics_root, title_prefix=tag)
         best = dec_metrics.iloc[0]
         print(f"  [{tag}] best LOSO decoder: {best['feature_set']} "
               f"AUC={best['macro_auc_ovr']:.3f} acc={best['accuracy']:.3f} F1={best['macro_f1']:.3f}")
@@ -864,6 +896,16 @@ def main():
     parser.add_argument("--coords_file", default=(
         "gnn_connectivity/data_scalp/biosemi64.txt"))
     parser.add_argument("--output_root", default="gnn_connectivity/output")
+    parser.add_argument("--data_root", default="data",
+                        help="Root prefix joined onto the per-variant data "
+                             "subpaths in DATA_DEFAULTS (default 'data', i.e. "
+                             "repo-relative). Explicit --*_dir flags still win.")
+    parser.add_argument("--rs_duration", default="0.8s",
+                        choices=["0.8s", "16s"],
+                        help="Resting-state epoch window: '0.8s' (crop -0.2..0.6 s, "
+                             "80 samples) or '16s' (full window, 1600 samples). "
+                             "Selects the rs folder set AND the timeseries window. "
+                             "Ignored when --type_data=lg (lg is always 0.8 s).")
     parser.add_argument("--run_name", default=None,
                         help="Defaults to wsmi_run_<timestamp>")
     parser.add_argument("--k", type=int, default=6)
@@ -887,7 +929,7 @@ def main():
                         choices=["load", "tune", "train", "test",
                                  "latents", "cluster", "all"])
     parser.add_argument("--models", nargs="+", default=["gae", "vgae"],
-                        choices=["gae", "vgae", "gae_vae", "enc_gae_fc"])
+                        choices=["gae", "vgae", "gae_vae", "gat_vae", "enc_gae_fc"])
     parser.add_argument("--input_mode", default="wsmi",
                         choices=["wsmi", "timeseries"],
                         help="Node-feature modality: pre-computed wSMI matrices "
@@ -978,6 +1020,20 @@ def main():
                         help="Randomly subsample at most N epochs per recording "
                              "(seeded). Bounds RAM / speeds tuning on large (lg) "
                              "datasets. Default None = use all epochs.")
+    parser.add_argument("--config_from", default=None,
+                        help="Path to a best_config.json to reuse instead of running "
+                             "Ray Tune. Skips the tune stage for every decoder model "
+                             "(model-specific params like beta_kl/corr_lambda fall back "
+                             "to defaults). Lets one tuned config per data-variant be "
+                             "shared across the model/cohort grid. Ignored for cebra.")
+    parser.add_argument("--cluster_use_real_wsmi", action="store_true",
+                        help="Deprecated / no-op: real wSMI mean matrices are now the "
+                             "default in timeseries mode. Kept for backward "
+                             "compatibility with older job manifests.")
+    parser.add_argument("--no_cluster_real_wsmi", action="store_true",
+                        help="Opt out of attaching real wSMI in timeseries mode; fall "
+                             "back to the per-cluster Pearson-correlation matrices "
+                             "recomputed from the raw voltage traces.")
     parser.add_argument("--cebra_tune", action="store_true",
                         help="Run a small grid search (temperature/lr/latent_dim) "
                              "for enc_gae_fc/cebra before training.")
@@ -985,16 +1041,19 @@ def main():
                         help="Tiny config for fast smoke test")
     args = parser.parse_args()
 
-    # --- resolve data-dir defaults from --type_data (explicit paths win) ---
-    d = DATA_DEFAULTS[args.type_data]
+    # --- resolve data-dir defaults from the variant (explicit paths win) ---
+    # Variant = type_data + rs_duration; subpaths are joined onto --data_root.
+    variant = _data_variant(args.type_data, args.rs_duration)
+    d = DATA_DEFAULTS[variant]
+    join = lambda p: os.path.join(args.data_root, p)
     if args.patient_dir is None:
-        args.patient_dir = d["wsmi_patient"]
+        args.patient_dir = join(d["wsmi_patient"])
     if args.control_dir is None and not args.patients_only:
-        args.control_dir = d["wsmi_control"]
+        args.control_dir = join(d["wsmi_control"])
     if args.timeseries_patient_dir is None:
-        args.timeseries_patient_dir = d["ts_patient"]
+        args.timeseries_patient_dir = join(d["ts_patient"])
     if args.timeseries_control_dir is None and not args.patients_only:
-        args.timeseries_control_dir = d["ts_control"]
+        args.timeseries_control_dir = join(d["ts_control"])
 
     # --- loss/model compatibility ---
     decoder_models = {"gae", "vgae", "gae_vae"}
@@ -1006,9 +1065,10 @@ def main():
         if "enc_gae_fc" in args.models:
             parser.error("--models enc_gae_fc requires --loss cebra "
                          "(it is encoder-only, no reconstruction for MSE)")
-    if args.loss == "mse_corr" and args.input_mode != "timeseries":
-        parser.error("--loss mse_corr is only meaningful with "
-                     "--input_mode timeseries (the Pearson regularizer)")
+    # --loss mse_corr works in BOTH input modes. On timeseries the Pearson
+    # regularizer preserves cross-electrode covariance over the time window; on
+    # wsmi it preserves the row-correlation structure of the 64x64 matrix
+    # (corr_loss reshapes each graph to (n_channels, n_features) either way).
 
     if args.input_mode == "timeseries":
         required = ["timeseries_patient_dir"]
@@ -1047,7 +1107,19 @@ def main():
 
         # GAE-family uses Ray Tune; the contrastive encoder uses an optional
         # lightweight grid (stage_tune_cebra), else fixed defaults.
-        if args.stage in ("tune", "all"):
+        # --config_from reuses a pre-tuned config (one per data-variant) and
+        # skips Ray Tune entirely for the decoder models.
+        if args.config_from and not cebra_path and args.stage in ("tune", "all"):
+            with open(args.config_from) as f:
+                best = json.load(f)
+            # Drop harvest bookkeeping keys (e.g. _source_run/_source_val_mse).
+            best = {k: v for k, v in best.items() if not k.startswith("_")}
+            tune_dir = os.path.join(out_root, "tuning", tag)
+            os.makedirs(tune_dir, exist_ok=True)
+            with open(os.path.join(tune_dir, "best_config.json"), "w") as f:
+                json.dump(best, f, indent=2, default=float)
+            print(f"\n=== STAGE: TUNE ({tag}) — SKIPPED, reusing {args.config_from} ===")
+        elif args.stage in ("tune", "all"):
             if cebra_path:
                 if args.cebra_tune:
                     best = stage_tune_cebra(args, out_root, data)

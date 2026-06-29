@@ -198,3 +198,105 @@ def loso_decoder(
     metrics_df = pd.DataFrame(metric_rows).sort_values("macro_auc_ovr", ascending=False).reset_index(drop=True)
     predictions_df = pd.concat(all_preds, ignore_index=True) if all_preds else pd.DataFrame()
     return metrics_df, predictions_df
+
+
+def plot_decoder_performance(
+    metrics_df: pd.DataFrame,
+    predictions_df: pd.DataFrame,
+    out_dir: str,
+    title_prefix: str = "",
+) -> List[str]:
+    """Render LOSO-decoder performance figures next to the TSV tables.
+
+    Writes:
+      - decoder_metrics_bars.png : grouped bar chart of macro_auc_ovr / accuracy /
+        macro_f1 per feature set (chance AUC=0.5 line), feature sets ordered by AUC.
+      - decoder_confusion.png    : one normalized confusion matrix per feature set
+        (rows = true, normalized to sum 1), shared class order.
+
+    Returns the list of files written. Safe to call with empty inputs.
+    """
+    import os
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    os.makedirs(out_dir, exist_ok=True)
+    written: List[str] = []
+    if metrics_df is None or len(metrics_df) == 0:
+        return written
+
+    pre = f"{title_prefix}: " if title_prefix else ""
+
+    # ---- (1) grouped metric bars ----
+    md = metrics_df.sort_values("macro_auc_ovr", ascending=False)
+    fsets = md["feature_set"].tolist()
+    metrics = [("macro_auc_ovr", "macro AUC (OvR)"),
+               ("accuracy", "accuracy"),
+               ("macro_f1", "macro F1")]
+    x = np.arange(len(fsets))
+    w = 0.26
+    fig, ax = plt.subplots(figsize=(max(7, 1.6 * len(fsets) + 3), 5))
+    for i, (col, lab) in enumerate(metrics):
+        vals = md[col].to_numpy(dtype=float) if col in md else np.full(len(fsets), np.nan)
+        bars = ax.bar(x + (i - 1) * w, vals, w, label=lab)
+        for b, v in zip(bars, vals):
+            if np.isfinite(v):
+                ax.text(b.get_x() + b.get_width() / 2, v + 0.01, f"{v:.2f}",
+                        ha="center", va="bottom", fontsize=7)
+    ax.axhline(0.5, ls="--", color="grey", lw=1, label="AUC chance (0.5)")
+    ax.set_xticks(x)
+    ax.set_xticklabels(fsets, rotation=30, ha="right")
+    ax.set_ylim(0, 1.05)
+    ax.set_ylabel("score")
+    ax.set_title(f"{pre}LOSO decoder performance by feature set")
+    ax.legend(fontsize=8, ncol=2)
+    plt.tight_layout()
+    p = os.path.join(out_dir, "decoder_metrics_bars.png")
+    plt.savefig(p, dpi=200, bbox_inches="tight")
+    plt.close()
+    written.append(p)
+
+    # ---- (2) per-feature-set confusion matrices ----
+    if predictions_df is not None and len(predictions_df) > 0:
+        classes = sorted(set(predictions_df["y_true"].astype(str)) |
+                         set(predictions_df["y_pred"].astype(str)))
+        ci = {c: i for i, c in enumerate(classes)}
+        fs_present = [f for f in fsets if f in set(predictions_df["feature_set"])]
+        n = len(fs_present)
+        if n:
+            ncol = min(3, n)
+            nrow = int(np.ceil(n / ncol))
+            fig, axes = plt.subplots(nrow, ncol, figsize=(4 * ncol, 3.6 * nrow),
+                                     squeeze=False)
+            axes = axes.flatten()
+            for ax, fs in zip(axes, fs_present):
+                sub = predictions_df[predictions_df["feature_set"] == fs]
+                cm = np.zeros((len(classes), len(classes)), dtype=float)
+                for yt, yp in zip(sub["y_true"].astype(str), sub["y_pred"].astype(str)):
+                    cm[ci[yt], ci[yp]] += 1
+                row = cm.sum(axis=1, keepdims=True)
+                cmn = np.divide(cm, row, out=np.zeros_like(cm), where=row > 0)
+                im = ax.imshow(cmn, vmin=0, vmax=1, cmap="Blues")
+                ax.set_title(fs, fontsize=9)
+                ax.set_xticks(range(len(classes)))
+                ax.set_yticks(range(len(classes)))
+                ax.set_xticklabels(classes, rotation=45, ha="right", fontsize=7)
+                ax.set_yticklabels(classes, fontsize=7)
+                ax.set_xlabel("predicted", fontsize=8)
+                ax.set_ylabel("true", fontsize=8)
+                for r in range(len(classes)):
+                    for c in range(len(classes)):
+                        ax.text(c, r, f"{cmn[r, c]:.2f}\n({int(cm[r, c])})",
+                                ha="center", va="center", fontsize=7,
+                                color="white" if cmn[r, c] > 0.5 else "black")
+                fig.colorbar(im, ax=ax, fraction=0.046)
+            for ax in axes[n:]:
+                ax.axis("off")
+            plt.suptitle(f"{pre}LOSO confusion matrices (row-normalized)", y=1.02)
+            plt.tight_layout()
+            p = os.path.join(out_dir, "decoder_confusion.png")
+            plt.savefig(p, dpi=200, bbox_inches="tight")
+            plt.close()
+            written.append(p)
+    return written
