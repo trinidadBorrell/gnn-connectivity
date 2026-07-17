@@ -39,11 +39,13 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_HERE, '..', 'src'))
 sys.path.insert(0, _HERE)
 
-from model import GNNEncoder  # noqa: E402
+from train import build_decoder_model  # noqa: E402  (handles enc_* AND autoencoders)
+from torch_geometric.nn import global_mean_pool  # noqa: E402
 import holdout_prediction as hp  # noqa: E402
 
 COARSE = {'control': 0, 'low_doc': 1, 'high_doc': 2}
 INV = {0: 'control', 1: 'low_doc', 2: 'high_doc'}
+ENCODER_KINDS = {'enc_gae_fc', 'enc_gat_fc'}
 
 
 def to_coarse(dx, dgroup):
@@ -61,9 +63,19 @@ def to_coarse(dx, dgroup):
 
 
 class Classifier(nn.Module):
-    def __init__(self, encoder, latent_dim, head='linear', hidden=32, dropout=0.3):
+    """Backbone (encoder-only OR autoencoder) + classification head.
+
+    - encoder-only (enc_gae_fc/enc_gat_fc): backbone returns one L2-normed
+      graph embedding directly.
+    - autoencoder (gae/vgae/gae_vae/gat_vae): use `model.encode` -> node latents
+      (VGAE/GAEVAE return (mu, logvar) -> mu), then global-mean-pool to one vector
+      per graph. Head input dim = latent_dim in every case.
+    """
+    def __init__(self, model, model_kind, latent_dim, head='linear',
+                 hidden=32, dropout=0.3):
         super().__init__()
-        self.encoder = encoder
+        self.model = model
+        self.is_encoder = model_kind in ENCODER_KINDS
         if head == 'linear':
             self.clf = nn.Linear(latent_dim, 3)
         else:
@@ -71,18 +83,26 @@ class Classifier(nn.Module):
                 nn.Linear(latent_dim, hidden), nn.ReLU(),
                 nn.Dropout(dropout), nn.Linear(hidden, 3))
 
+    def embed(self, x, edge_index, batch):
+        if self.is_encoder:
+            return self.model(x, edge_index, batch)      # (G, latent), L2-normed
+        enc = self.model.encode(x, edge_index)           # node latents (or (mu,..))
+        z_nodes = enc[0] if isinstance(enc, tuple) else enc
+        if batch is None:
+            batch = x.new_zeros(x.size(0), dtype=torch.long)
+        return global_mean_pool(z_nodes, batch)          # (G, latent)
+
     def forward(self, x, edge_index, batch):
-        z = self.encoder(x, edge_index, batch)   # (G, latent_dim), L2-normed
-        return self.clf(z)
+        return self.clf(self.embed(x, edge_index, batch))
 
 
-def build_encoder(ckpt_path, device):
+def build_model(ckpt_path, device):
     ck = torch.load(ckpt_path, map_location=device, weights_only=False)
     cfg = ck['config']
-    enc = GNNEncoder(cfg['in_channels'], hidden_dims=cfg.get('hidden_dims'),
-                     latent_dim=cfg['latent_dim'], dropout=cfg.get('dropout', 0.2))
-    enc.load_state_dict(ck['model_state_dict'])
-    return enc.to(device), cfg
+    model_kind = cfg.get('model_kind') or cfg.get('model') or 'enc_gae_fc'
+    model = build_decoder_model(model_kind, cfg['in_channels'], cfg)
+    model.load_state_dict(ck['model_state_dict'])
+    return model.to(device), model_kind, cfg
 
 
 def main():
@@ -139,10 +159,10 @@ def main():
 
     for fi, (tr, te) in enumerate(folds):
         t0 = time.time()
-        enc, cfg = build_encoder(ckpt_path, device)
-        clf = Classifier(enc, cfg['latent_dim'], head=args.head).to(device)
+        model, model_kind, cfg = build_model(ckpt_path, device)
+        clf = Classifier(model, model_kind, cfg['latent_dim'], head=args.head).to(device)
         if args.mode == 'frozen':
-            for p in clf.encoder.parameters():
+            for p in clf.model.parameters():
                 p.requires_grad = False
             params = list(clf.clf.parameters())
         else:
@@ -166,7 +186,7 @@ def main():
             if args.mode == 'full':
                 clf.train()
             else:
-                clf.encoder.eval()
+                clf.model.eval()
                 clf.clf.train()
             for batch in loader:
                 batch = batch.to(device)
