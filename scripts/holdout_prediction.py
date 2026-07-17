@@ -232,6 +232,9 @@ def main():
                          'tiny singleton clusters at the cost of slightly less '
                          'fitted detail.')
     ap.add_argument('--random_state', type=int, default=42)
+    ap.add_argument('--exclude_dx', default='',
+                    help='comma-sep diagnoses to drop before analysis, e.g. '
+                         '"EMCS,COMA" to match the GNN 127-subject cohort')
     args = ap.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -243,8 +246,12 @@ def main():
     df['matrix_idx'] = df['matrix_idx'].astype(int)
     df = df.sort_values(['subject_id', 'session_num', 'matrix_idx']).reset_index(drop=True)
     df = attach_diagnoses(df, args.labels_csv)
-    # Drop unknown diagnoses from the analysis
+    # Drop unknown diagnoses from the analysis (+ any explicitly excluded)
     valid_dx = set(DX_ORDER_FULL)
+    excluded = {d.strip() for d in args.exclude_dx.split(',') if d.strip()}
+    if excluded:
+        valid_dx -= excluded
+        print(f"  excluding diagnoses {sorted(excluded)} (cohort match)")
     drop_mask = ~df['diagnosis'].isin(valid_dx)
     if drop_mask.any():
         print(f"  dropping {drop_mask.sum()} epochs with unknown/missing diagnoses")

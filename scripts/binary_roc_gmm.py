@@ -177,6 +177,9 @@ def main():
     ap.add_argument('--n_folds', type=int, default=5)
     ap.add_argument('--n_reps', type=int, default=5)
     ap.add_argument('--random_state', type=int, default=42)
+    ap.add_argument('--exclude_dx', default='',
+                    help='comma-sep diagnoses to drop, e.g. "EMCS,COMA" to '
+                         'match the GNN 127-subject cohort')
     args = ap.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -185,6 +188,10 @@ def main():
     print(f"[1/4] streaming features")
     X_full, df = stream_features(args.data_dir, args.labels_csv)
     keep = df['diagnosis'].isin(DX_TO_COARSE).to_numpy()
+    excluded = {d.strip() for d in args.exclude_dx.split(',') if d.strip()}
+    if excluded:
+        keep &= ~df['diagnosis'].isin(excluded).to_numpy()
+        print(f"  excluding diagnoses {sorted(excluded)} (cohort match)")
     df = df[keep].reset_index(drop=True)
     df['orig_index'] = np.arange(len(df))
     X_full = X_full[keep]
