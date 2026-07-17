@@ -107,6 +107,17 @@ If the GAE matches or barely exceeds these, the learned representation
 is recapitulating raw-wSMI structure. If it pulls notably ahead, we've
 found a useful encoding.
 
+> **UPDATE (2026-07-17) — the learned GNN cleared the bar.** A
+> **CEBRA contrastive graph encoder (frozen) + a supervised MLP probe** on
+> the 256-electrode data reaches **3-class bal_acc 0.673 ± 0.070** (> the
+> 0.612 floor) and **control-vs-DOC AUC 0.940 ± 0.067 — the best of any
+> method, beating even the fully supervised end-to-end GCN (0.931)**.
+> MCS-vs-UWS stays at the ~0.69 ceiling (multi-band still needed). Full
+> recipe + exact hyperparameters + reproduction commands in
+> [chapter 7 §7.8–7.9](./chapter_07_gae_benchmark_plan.md#79-sota-summary--exact-reproduction-recipe).
+> Winning config: `enc_gae_fc`/CEBRA, `latent_dim=32`, `temperature=0.1`
+> (fixed), frozen encoder + 2-layer MLP head, class-weighted CE.
+
 ---
 
 ## Where the artefacts live

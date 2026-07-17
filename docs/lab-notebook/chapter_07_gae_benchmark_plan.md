@@ -65,6 +65,72 @@ hand-engineered PCA+GMM baseline and a supervised GCN on the clean axis, from
 theta-wSMI alone. (Caveat: control-vs-DOC has 2–4 controls/fold → confirm 0.94
 with LOOCV / a second seed.)
 
+### 7.9 SOTA summary + exact reproduction recipe
+
+**Current best (SOTA) on 256-electrode theta-wSMI, subject-disjoint 5-fold,
+last-100 epochs/session:**
+
+| method | 3-class bal_acc | control-vs-DOC AUC | MCS-vs-UWS AUC |
+|---|---|---|---|
+| **CEBRA (frozen) + MLP probe** ⭐ | **0.673 ± 0.070** | **0.940 ± 0.067** | 0.693 ± 0.057 |
+| Supervised GCN (end-to-end) | 0.527 | 0.931 ± 0.083 | 0.678 ± 0.155 |
+| CEBRA (frozen) + GMM K=6 | 0.623 ± 0.057 | 0.877 ± 0.085 | 0.660 ± 0.065 |
+| GMM K=3 on raw wSMI (baseline) | 0.611 ± 0.131 | 0.815 ± 0.095 | 0.713 ± 0.155 |
+
+**The winning pipeline** = *contrastive pretrain → freeze → supervised MLP probe*:
+
+1. **Data.** 256-electrode wSMI-theta `.npz` tree (`data/wsmi_res`), loaded via
+   `load_wsmi_dataset_npz` (`--wsmi_format npz`, `--coords_file
+   GSN-HydroCel-257.txt`), last 100 epochs/session (`--max_epochs_per_recording
+   100`). Nodes = 256 electrodes; node features = the 256-d wSMI row; edges =
+   k-NN (k=6) on electrode XYZ. Coarse target control / low_doc / high_doc.
+
+2. **Encoder — CEBRA (`enc_gae_fc` = `GNNEncoder`), contrastive InfoNCE:**
+   - SAGEConv stack `256 → [64, 64, 32, 16] → mean-pool → FC → latent`
+   - **`latent_dim = 32`** (the dominant lever — 8→16→32 monotonically better)
+   - **`temperature = 0.1`, FIXED** (`--cebra_fixed_temp`; default 1.0 is far too
+     soft and was the main reason the out-of-the-box CEBRA failed)
+   - `dropout 0.1`, `lr 1e-3`, `weight_decay 1e-5`, `batch_size 256`
+   - positives = temporally-adjacent epochs (i, i+1) in the same recording;
+     in-batch negatives; L2-normalized embedding (unit hypersphere)
+
+3. **Readout — freeze encoder, train a 2-layer MLP head with class-weighted CE:**
+   - head = `Linear(32→32) → ReLU → Dropout(0.3) → Linear(32→3)` + softmax
+   - `--mode frozen --head mlp`, `epochs 40`, `lr 1e-3`, `weight_decay 1e-4`,
+     `batch_size 128`, `random_state 42`
+   - fresh encoder+head rebuilt per fold from the checkpoint (no leakage);
+     per-subject prediction = mean softmax over the subject's epochs
+
+**Reproduce:**
+```bash
+# 1. pretrain the CEBRA encoder on 256 nodes (GPU)
+sbatch --partition=parietal slurm/train_wsmi256.sbatch \
+    --models enc_gae_fc --loss cebra \
+    --cebra_fixed_temp --cebra_temperature 0.1 --cebra_latent_dim 32 \
+    --run_name wsmi256_cebra_t10_d32
+# 2. frozen encoder + MLP probe (GPU) -> 3-class bal_acc + per_subject_proba
+sbatch slurm/finetune_encoder.sbatch \
+    --run_name wsmi256_cebra_t10_d32 --mode frozen --head mlp
+# 3. binary AUCs vs baseline + supervised (CPU)
+python scripts/compare_roc.py \
+    --gmm_k3 output/roc_gmm_K3_5fold --gmm_k4 output/roc_gmm_K4_5fold \
+    --supervised output/supervised \
+    --moco output/wsmi256_cebra_t10_d32/finetune_frozen_mlp \
+    --moco_label CEBRA-frozen-MLP --output_dir output/roc_compare_frozen
+```
+
+**Also tried, worse (not worth expanding):**
+- *GMM readout instead of the MLP probe* — good (0.623 / 0.877) but below the
+  probe; the L2-normalized latent wants K=6 not K=3.
+- *Full end-to-end fine-tune* (train the encoder with CE) — **collapses to 0.406**
+  (small-data overfitting of the encoder on ~127 subjects). Freeze, don't fine-tune.
+- *Default CEBRA* (τ=1.0, latent=8) — 0.471; misconfigured temperature + latent.
+- *τ=0.05/d=16* — 0.522; d=32 clearly better.
+- *Reconstruction GAE/VGAE/GAEVAE/GATVAE* — expected ≤ baseline (reconstruction is
+  the wrong loss for wSMI, ch 5); lean runs in progress for completeness.
+- *MoCo augmentation-contrastive* (ch 5/6) — underperformed; augmentation invariance
+  discards the discriminative coupling structure. CEBRA's *temporal* positives avoid this.
+
 *Caveats:* control-vs-DOC has few controls/fold (n_pos 2–4), so read +0.06 as
 "improvement with overlapping bands"; the direction + tighter variance are
 consistent. In the saved figure CEBRA was relabeled from the `--moco` slot via
