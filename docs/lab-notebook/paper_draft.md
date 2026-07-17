@@ -1,5 +1,13 @@
 # Paper draft — unsupervised wSMI clustering for disorders of consciousness
 
+> **⚠️ SUPERSEDED (2026-07-17): use [narrative.md](./narrative.md) as the current
+> full-paper structure.** This file is the earlier *unsupervised-only* skeleton
+> (written before the GNN phase); its "future work → GAE" items are now completed
+> results. `narrative.md` folds in the self-supervised graph representation
+> (frozen CEBRA + MLP probe), the cohort-controlled 2×2 comparison, and the
+> code-verified methods. Keep this file for the abstract/related-work prose drafts,
+> but take the results structure and numbers from `narrative.md`.
+
 > **Status**: skeleton with section briefs (≤ 3–4 sentences each). Each
 > section points to the lab-notebook chapter that has the full numbers,
 > figures, and methodology. Final writing should be done from those
