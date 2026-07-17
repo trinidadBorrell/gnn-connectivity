@@ -1,8 +1,61 @@
-# Chapter 7 — Benchmarking the learned GNN representations (plan)
+# Chapter 7 — Benchmarking the learned GNN representations
 
-> **Status**: PLAN + draft scripts. Not yet run. Written 2026-07-17 after
-> merging `origin/main` (GAE/VGAE/GAEVAE/GATVAE + CEBRA encoder + Ray-Tune
-> pipeline) into `gio-grid-search-clustering`.
+> **Status**: RESULTS IN (2026-07-17). Plan + scripts below; headline results
+> in §7.8. Ran on the 256-electrode data (fair comparison, Path A of §7.2).
+
+---
+
+## 7.8 RESULTS — tuned CEBRA GNN matches the baseline and beats it on control-vs-DOC
+
+All on 256-electrode wSMI, subject-disjoint 5-fold, last-100 epochs/session,
+identical protocol to the raw-wSMI baseline. Eval via `gae_latent_eval.py`
+(GMM-K on the latent) + `compare_roc.py` (binary AUC).
+
+**CEBRA config sweep (3-class bal_acc, GMM readout):** the default CEBRA is
+badly configured (τ=1.0, latent=8). Fixing it is the whole story:
+
+| CEBRA config | K=3 | K=6 |
+|---|---|---|
+| τ=1.0, d=8 (pipeline default) | 0.471 | 0.499 |
+| τ=0.05, d=16 | 0.465 | 0.522 |
+| **τ=0.1, d=32** (best) | 0.562 | **0.623 ± 0.057** |
+| raw-wSMI baseline | | 0.611 ± 0.131 |
+
+Dominant lever = **latent_dim**; then temperature; then the readout (the latent
+is L2-normalized onto a sphere → GMM likes more clusters, K=6 > K=3). LOOCV
+tempers it: tuned CEBRA 0.569 vs baseline 0.590 pooled — so on 3-class accuracy
+the GNN is a **statistical wash with the baseline**, with tighter 5-fold variance.
+
+**Binary AUC (the differentiator)** — `output/roc_compare_cebra/`:
+
+| model | control-vs-DOC | MCS-vs-UWS |
+|---|---|---|
+| GMM K=3 (unsup baseline) | 0.815 ± 0.095 | 0.713 ± 0.155 |
+| **Tuned CEBRA GNN** | **0.877 ± 0.085** | 0.660 ± **0.065** |
+| Supervised GCN (ch 6) | 0.931 ± 0.083 | 0.678 ± 0.155 |
+
+**Headline:** the tuned CEBRA graph encoder **beats the unsupervised GMM baseline
+on control-vs-DOC (+0.06 AUC), unsupervised** — sitting between the baseline and
+the fully-supervised model — and is the **most stable** model (tightest variance
+on both binary tasks). The **MCS-vs-UWS ceiling (~0.66–0.72) holds for every
+method** → the within-DOC boundary needs multi-band features, not more encoder
+tuning (§7.6 lever #2).
+
+*Caveats:* control-vs-DOC has few controls/fold (n_pos 2–4), so read +0.06 as
+"improvement with overlapping bands"; the direction + tighter variance are
+consistent. In the saved figure CEBRA was relabeled from the `--moco` slot via
+`compare_roc.py --moco_label`.
+
+**Open follow-ups (in flight):** latent_dim=64/128 push; supervised heads on the
+CEBRA encoder (`scripts/finetune_encoder.py`, `--mode full` end-to-end +
+`--mode frozen` linear/MLP probe) — direct CE classification vs the GMM readout;
+the four reconstruction models (GAE/VGAE/GAEVAE/GATVAE) still tuning.
+
+---
+
+> **Original plan (2026-07-17)** after merging `origin/main`
+> (GAE/VGAE/GAEVAE/GATVAE + CEBRA encoder + Ray-Tune pipeline) into
+> `gio-grid-search-clustering`.
 
 > **Goal**: for the first time, score the *learned* graph representations
 > (reconstruction autoencoders **and** the CEBRA temporal-contrastive

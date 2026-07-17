@@ -133,7 +133,9 @@ def main():
     ap.add_argument('--gmm_k4', required=True)
     ap.add_argument('--supervised', required=True)
     ap.add_argument('--moco', default=None,
-                    help='Path to MoCo (contrastive) per_subject_proba.csv dir; optional')
+                    help='Path to a contrastive/encoder per_subject_proba.csv dir; optional')
+    ap.add_argument('--moco_label', default='MoCo GCN (wave 1)',
+                    help='Legend label for the --moco model (e.g. "CEBRA (tuned)")')
     ap.add_argument('--output_dir', required=True)
     ap.add_argument('--n_boot', type=int, default=1000)
     ap.add_argument('--random_state', type=int, default=42)
@@ -147,7 +149,7 @@ def main():
         ('Supervised GCN', args.supervised, '#2ca02c'),
     ]
     if args.moco is not None:
-        models.append(('MoCo GCN (wave 1)', args.moco, '#d62728'))
+        models.append((args.moco_label, args.moco, '#d62728'))
 
     summary = {}
     raw_by_model = {}
