@@ -190,7 +190,7 @@ def main():
     keep = df['diagnosis'].isin(DX_TO_COARSE).to_numpy()
     excluded = {d.strip() for d in args.exclude_dx.split(',') if d.strip()}
     if excluded:
-        keep &= ~df['diagnosis'].isin(excluded).to_numpy()
+        keep = keep & (~df['diagnosis'].isin(excluded).to_numpy())
         print(f"  excluding diagnoses {sorted(excluded)} (cohort match)")
     df = df[keep].reset_index(drop=True)
     df['orig_index'] = np.arange(len(df))
