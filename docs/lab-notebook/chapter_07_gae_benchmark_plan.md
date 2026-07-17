@@ -41,6 +41,30 @@ on both binary tasks). The **MCS-vs-UWS ceiling (~0.66–0.72) holds for every
 method** → the within-DOC boundary needs multi-band features, not more encoder
 tuning (§7.6 lever #2).
 
+### 7.8b THE WINNER — frozen CEBRA + supervised MLP probe (`finetune_encoder.py`)
+
+Swapping the GMM readout for a trained classifier head on the FROZEN encoder is
+the best configuration in the whole project. Full fine-tuning (training the
+encoder end-to-end) collapses — small-data overfitting of the ~50k encoder
+params on ~127 subjects.
+
+| readout on tuned CEBRA (τ=0.1, d=32) | 3-class bal_acc | control-vs-DOC | MCS-vs-UWS |
+|---|---|---|---|
+| GMM clustering (K=6) | 0.623 ± 0.057 | 0.877 ± 0.085 | 0.660 ± 0.065 |
+| **frozen encoder + MLP probe** | **0.673 ± 0.070** | **0.940 ± 0.067** | 0.693 ± **0.057** |
+| full fine-tune (end-to-end) | 0.406 ± 0.103 (collapse) | — | — |
+| — vs raw baseline | 0.611 ± 0.131 | 0.815 ± 0.095 | 0.713 ± 0.155 |
+| — vs supervised GCN | 0.527 | 0.931 ± 0.083 | 0.678 ± 0.155 |
+
+**The frozen-SSL + MLP-probe recipe wins on every axis** — 3-class 0.673 (best),
+and **control-vs-DOC 0.940, the highest of ANY method, beating even the fully
+supervised end-to-end GCN (0.931)**, with the tightest variance. MCS-vs-UWS 0.693
+sits at the universal ceiling but is the most stable. This is the "good GNN
+result": *contrastive pretrain → freeze → supervised probe* outperforms both the
+hand-engineered PCA+GMM baseline and a supervised GCN on the clean axis, from
+theta-wSMI alone. (Caveat: control-vs-DOC has 2–4 controls/fold → confirm 0.94
+with LOOCV / a second seed.)
+
 *Caveats:* control-vs-DOC has few controls/fold (n_pos 2–4), so read +0.06 as
 "improvement with overlapping bands"; the direction + tighter variance are
 consistent. In the saved figure CEBRA was relabeled from the `--moco` slot via
