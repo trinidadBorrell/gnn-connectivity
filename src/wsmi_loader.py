@@ -297,6 +297,144 @@ def load_wsmi_dataset(
     return graphs, subject_ids, diagnosis_groups
 
 
+def load_wsmi_dataset_npz(
+    data_dir: str,
+    diagnosis_csv: str,
+    coords_file: str,
+    k: int = 6,
+    control_dir: Optional[str] = None,
+    include_controls: bool = True,
+    npz_key: str = "data",
+    subject_filter: Optional[set] = None,
+    granularity: str = "coarse",
+    max_epochs_per_recording: Optional[int] = None,
+    seed: int = 42,
+    verbose: bool = True,
+) -> Tuple[List[Data], List[str], List[str]]:
+    """`.npz` counterpart of `load_wsmi_dataset` for the 256-electrode data.
+
+    The 256 EGI baseline data (`data/wsmi_res`) is stored as per-session `.npz`
+    files of shape `(n_epochs, n, n)` (n=256), NOT the junifer `.pkl (1,n,64,64)`
+    that `load_wsmi_dataset` reads. This loader walks that tree with the SAME
+    `EEGtoGraph.enumerate_matrix_sessions` the raw-wSMI baseline uses, so it sees
+    exactly the epochs the 0.61 / 0.82 numbers were computed on — making a GNN
+    trained here head-to-head comparable (see docs/lab-notebook/chapter_07).
+
+    Node count is inferred from `coords_file` (pass the 257-coord file for 256
+    nodes). Everything downstream (models, training, gae_latent_eval) is
+    channel-agnostic. Returns the same `(graphs, subject_ids, diagnosis_groups)`
+    contract as `load_wsmi_dataset`, with identical per-graph metadata.
+
+    Cohort is taken from the `wsmi_res_{DOC,control}` path tag that
+    `enumerate_matrix_sessions` attaches, falling back to the numeric-subject-id
+    rule. Controls are dropped when `include_controls=False` (patients_only).
+    `control_dir`, if given, is scanned as an extra tree (deduped by sub/ses).
+    """
+    lookup = _load_diagnosis_lookup(diagnosis_csv)
+    adjacency, electrode_labels = _build_adjacency(coords_file, k=k)
+    edge_index = torch.tensor(
+        np.array(adjacency.tocoo().nonzero()), dtype=torch.long
+    )
+    n_nodes = len(electrode_labels)
+    rng = np.random.default_rng(seed)
+
+    graphs: List[Data] = []
+    subject_ids: List[str] = []
+    diagnosis_groups: List[str] = []
+
+    roots = [data_dir] + ([control_dir] if control_dir else [])
+    seen = set()  # dedupe (subject, session) across roots
+    n_files = n_epochs = n_dropped = n_skipped_ctrl = 0
+
+    for root in roots:
+        if not root or not os.path.isdir(root):
+            if verbose:
+                print(f"  skipping missing folder: {root}")
+            continue
+        for sub_id, ses, source in EEGtoGraph.enumerate_matrix_sessions(root):
+            if source.get("kind") != "npz":
+                continue
+            if subject_filter is not None and sub_id not in subject_filter:
+                continue
+            key = (sub_id, ses)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            cohort = (source.get("cohort") or "").lower()
+            is_control = cohort == "control" or (cohort == "" and _is_control(sub_id))
+            if is_control and not include_controls:
+                n_skipped_ctrl += 1
+                continue
+
+            n_files += 1
+            try:
+                with np.load(source["path"], allow_pickle=False) as d:
+                    if npz_key not in d:
+                        if verbose:
+                            print(f"  WARN {source['path']} missing key "
+                                  f"'{npz_key}' (keys={list(d.keys())})")
+                        continue
+                    arr = d[npz_key]  # (n_epochs, n, n)
+            except Exception as e:
+                if verbose:
+                    print(f"  WARN failed to read {source['path']}: {e}")
+                continue
+            if arr.ndim != 3 or arr.shape[1] != n_nodes or arr.shape[2] != n_nodes:
+                if verbose:
+                    print(f"  WARN unexpected shape {arr.shape} "
+                          f"(expected (_, {n_nodes}, {n_nodes})) in {source['path']}")
+                continue
+
+            if is_control:
+                diag, diag_group = "HC", "CONTROL"
+            else:
+                diag, diag_group = _resolve_diagnosis(sub_id, ses, lookup, granularity)
+            if diag_group == DROP_GROUP:
+                n_dropped += 1
+                continue
+
+            group_name = "control" if is_control else "patient"
+            n_ep = arr.shape[0]
+            # Cap = the LAST n epochs (deterministic), matching the raw-wSMI
+            # baseline's last_100 window and bounding memory (256-node graphs
+            # are 16x heavier than biosemi64: the full set is ~68 GB in RAM).
+            if max_epochs_per_recording is not None and n_ep > max_epochs_per_recording:
+                epoch_indices = range(n_ep - max_epochs_per_recording, n_ep)
+            else:
+                epoch_indices = range(n_ep)
+            for epoch_idx in epoch_indices:
+                mat = _symmetrize_and_clean(arr[epoch_idx])
+                x = torch.tensor(mat, dtype=torch.float32)
+                data = Data(x=x, edge_index=edge_index)
+                data.subject_id = sub_id
+                data.session_num = ses
+                data.acq = source.get("cohort") or ""
+                data.matrix_idx = int(epoch_idx)
+                data.diagnosis = diag
+                data.diagnosis_group = diag_group
+                data.group = group_name
+                data.electrode_labels = electrode_labels
+                data.raw_matrix = mat
+                graphs.append(data)
+                subject_ids.append(sub_id)
+                diagnosis_groups.append(diag_group)
+                n_epochs += 1
+
+    if verbose:
+        print(f"  npz: {n_files} sessions, {n_epochs} epoch-graphs from {roots} "
+              f"(dropped {n_dropped} recordings; skipped {n_skipped_ctrl} control "
+              f"sessions [include_controls={include_controls}])")
+        print(f"Total graphs: {len(graphs)}; unique subjects: {len(set(subject_ids))}")
+        from collections import Counter
+        print(f"Diagnosis-group counts (graphs): {dict(Counter(diagnosis_groups))}")
+        per_subj_group = {s: g for s, g in zip(subject_ids, diagnosis_groups)}
+        print(f"Diagnosis-group counts (subjects): "
+              f"{dict(Counter(per_subj_group.values()))}")
+
+    return graphs, subject_ids, diagnosis_groups
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -306,10 +444,18 @@ if __name__ == "__main__":
     parser.add_argument("--diagnosis_csv", required=True)
     parser.add_argument("--coords_file", required=True)
     parser.add_argument("--k", type=int, default=6)
+    parser.add_argument("--format", choices=["pkl", "npz"], default="pkl",
+                        help="pkl = junifer 64x64; npz = per-session 256x256 tree")
     args = parser.parse_args()
 
-    graphs, subj, grp = load_wsmi_dataset(
-        args.patient_dir, args.control_dir, args.diagnosis_csv,
-        args.coords_file, k=args.k,
-    )
+    if args.format == "npz":
+        graphs, subj, grp = load_wsmi_dataset_npz(
+            args.patient_dir, args.diagnosis_csv, args.coords_file, k=args.k,
+            control_dir=args.control_dir,
+        )
+    else:
+        graphs, subj, grp = load_wsmi_dataset(
+            args.patient_dir, args.control_dir, args.diagnosis_csv,
+            args.coords_file, k=args.k,
+        )
     print(f"\nSummary: {len(graphs)} graphs across {len(set(subj))} subjects")

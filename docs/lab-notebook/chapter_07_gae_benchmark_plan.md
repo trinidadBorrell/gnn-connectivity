@@ -1,0 +1,222 @@
+# Chapter 7 — Benchmarking the learned GNN representations (plan)
+
+> **Status**: PLAN + draft scripts. Not yet run. Written 2026-07-17 after
+> merging `origin/main` (GAE/VGAE/GAEVAE/GATVAE + CEBRA encoder + Ray-Tune
+> pipeline) into `gio-grid-search-clustering`.
+
+> **Goal**: for the first time, score the *learned* graph representations
+> (reconstruction autoencoders **and** the CEBRA temporal-contrastive
+> encoder) on the **same held-out protocol** that produced the raw-wSMI
+> baseline, so the numbers are head-to-head comparable.
+>
+> **Baseline to beat** (chapters 3 / 6):
+>
+> | metric | raw-wSMI floor | aspirational |
+> |---|---|---|
+> | in-sample Cramér's V | 0.280 | ≥ 0.30 |
+> | held-out 3-class bal_acc (5-fold mean) | 0.611 ± 0.131 | ≥ 0.65 |
+> | control-vs-DOC AUC | 0.815 ± 0.095 | ≥ 0.90 |
+> | MCS-vs-UWS AUC | 0.713 ± 0.155 | > 0.75 (**the real target**) |
+> | high_doc recall | 48 % | ≥ 60 % |
+
+---
+
+## 7.1 The problem this chapter fixes — two disjoint codebases
+
+After the merge the repo holds two GNN lines that never shared an
+evaluation:
+
+| | notebook thread (ch 1–6) | main pipeline (`run_wsmi_pipeline.py`) |
+|---|---|---|
+| montage | 256 EGI (`data/wsmi_res`) | 64 biosemi (`data/markers/wsmi_theta/…biosemi64`) |
+| models | `contrastive_model.Encoder`, supervised DenseGCN | `src/model.py`: GAE / VGAE / GAEVAE / GATVAE / GNNEncoder / GATEncoder |
+| loss | MoCo (failed), supervised CE | reconstruction MSE (+KL, +corr), CEBRA temporal-InfoNCE |
+| scoring | `holdout_prediction.py` → bal_acc / AUC | val MSE + internal ARI/purity + LOSO |
+
+The main-pipeline models have **only ever been scored on reconstruction
+MSE and internal clustering metrics** — never on the last_100×balanced ×
+GroupKFold × GMM-K3 protocol that the paper's 0.61 / 0.82 numbers use.
+So we cannot yet say whether any learned encoder beats raw PCA(50).
+
+`scripts/contrastive_eval.py` already bridges the notebook's 256-node
+`Encoder` into that protocol. This chapter generalises that bridge to
+**any `src/model.py` model** via the existing
+`cluster_analysis.extract_latents_from_graphs`.
+
+---
+
+## 7.2 The montage decision — 256 is the fair comparison
+
+The baseline (V=0.28, bal_acc 0.61, AUC 0.82) is on **256 EGI**. The
+scientific question is *"does a learned GNN latent beat PCA(50) on the
+SAME inputs?"* — so the fair comparison holds the data fixed at 256 and
+swaps ONLY the representation. Training the GNN on 64 biosemi instead
+confounds representation quality with electrode count (a 64-node loss
+could just mean 64 electrodes carry less signal). 256 is also the
+setting that *favours* the GNN — its whole value is the spatial
+message-passing graph, and a 256-node scalp graph is richer than 64.
+
+- **Primary — everything on 256 EGI (fair, recommended).** Train
+  GAE/VGAE/CEBRA on the same `data/wsmi_res` matrices the baseline used
+  (`in_channels=256`, `--coords_file data_scalp/GSN-HydroCel-257.txt`),
+  then score with `gae_latent_eval.py` against the *existing* 0.61 floor.
+  **Cost: needs a 256-capable loader (see 7.2a) + a GPU retrain of each
+  GNN.** This is the number for the paper.
+- **Secondary ablation — 64 biosemi (optional).** Answers a *different*
+  question ("does the harmonized/lower-resolution montage help or
+  hurt?"), NOT a fair head-to-head with the baseline. Only run if 256 is
+  inconclusive. Would also need a re-computed 64-node GMM floor to be
+  interpretable.
+
+### 7.2a The loader — DONE (`load_wsmi_dataset_npz`)
+
+`src/wsmi_loader.load_wsmi_dataset` reads junifer `.pkl (1,n,64,64)` and
+**skips anything not 64×64**. So a `.npz` 256-capable loader was added:
+`src/wsmi_loader.load_wsmi_dataset_npz` walks the 256 tree with the SAME
+`EEGtoGraph.enumerate_matrix_sessions` the raw-wSMI baseline uses (so it
+sees exactly the baseline's epochs), reusing the channel-agnostic
+adjacency / clean / diagnosis helpers. Node count is inferred from
+`--coords_file` (`GSN-HydroCel-257.txt` = 256 nodes, verified). Cohort
+comes from the `wsmi_res_{DOC,control}` path tag.
+
+Wired into the pipeline via `--wsmi_format {pkl,npz}` (default `pkl`,
+preserves old behaviour); `stage_load` branches to the npz loader when
+`--wsmi_format npz`. **Status: VALIDATED on real data** (cluster job
+372171, 2026-07-17): 4 subjects → 40 graphs, `x` shape `(256, 256)`,
+`edge_index (2, 1640)` k=6 graph, cohort tags + diagnosis lookup correct
+(controls→CONTROL/HC, patients→COMA/UWS in fine granularity).
+
+**Memory caveat (important for the training run).** At 256 nodes each
+graph holds a 256×256 `x` (+ a 256×256 `raw_matrix` copy) ≈ 0.5 MB, so
+the FULL ~130k-epoch dataset is ≈ 68 GB in RAM — it will OOM a normal
+node (the 64-node pipeline was 16× smaller and never hit this). For the
+256 training run, cap epochs with `--max_epochs_per_recording 100`
+(matches the baseline's last_100 anyway → ~9 GB), or wire in the mmap
+`src/lazy_dataset.py`. The eval (`gae_latent_eval.py`) already takes
+`--last_n 100`, so it's fine.
+
+---
+
+## 7.3 The bridge — `scripts/gae_latent_eval.py`
+
+Mirror of `contrastive_eval.py`, but features come from a trained
+`src/model.py` autoencoder instead of the 256-node `Encoder`:
+
+1. Load `output/<run>/splits/graphs.pt` (the cached per-epoch graphs with
+   metadata) and `output/<run>/models/<tag>/model.pt`
+   (`{"model_state_dict", "config"}`).
+2. Rebuild the model with `train.build_decoder_model(model_kind, in_ch,
+   config)`, load the state dict, `.eval()`.
+3. `extract_latents_from_graphs(model, graphs, splits,
+   aggregate=args.graph_latent_agg)` → one latent vector per epoch
+   (`mean` or `flatten`; VGAE uses `mu`).
+4. Build a dataframe from the bundle metadata (subject / session /
+   matrix_idx / diagnosis), apply the **last_n per-session mask**, map
+   diagnoses to coarse via `holdout_prediction.DX_TO_COARSE`.
+5. Run the identical fold loop from `contrastive_eval.py`: balance train
+   by diagnosis → GMM(K=3) on latents → soft/hard per-subject fingerprint
+   → LogisticRegression → per-fold + pooled bal_acc, and dump
+   `per_subject_proba.csv` so `scripts/compare_roc.py` can add it to the
+   binary-AUC panel.
+
+Encoder-only models (`enc_gae_fc` / `enc_gat_fc`) use
+`extract_embeddings_encoder` instead of `extract_latents_from_graphs`
+(graph-level pooled embedding, no `edge_index`-free path) — same
+downstream.
+
+**Draft** at `scripts/gae_latent_eval.py`, sbatch
+`slurm/gae_latent_eval.sbatch`. Untested — smoke first (§7.5).
+
+---
+
+## 7.4 Run matrix (Path A)
+
+Assuming trained biosemi runs exist (or are produced with
+`run_wsmi_pipeline.py --stage all`):
+
+| model | loss | why it's interesting |
+|---|---|---|
+| GAE | mse | reconstruction floor — expected to ≈ or < baseline (ch 5 argument) |
+| VGAE | mse | does the KL-regularised latent cluster better? watch for posterior collapse |
+| GAEVAE | mse | MLP bottleneck — cleaner latent geometry |
+| GATVAE | mse | attention adjacency vs fixed k-NN |
+| **enc_gae_fc** | **cebra** | **temporal-contrastive — the fix for the MoCo failure. Top priority.** |
+| enc_gat_fc | cebra | attention + temporal contrastive |
+
+For each: pooled + per-fold 3-class bal_acc, control-vs-DOC AUC,
+MCS-vs-UWS AUC, high_doc recall. Compare against the 64-node GMM floor
+from §7.2 Path A.
+
+---
+
+## 7.5 Smoke test + full 256 run (on the cluster, not the frontale)
+
+**Step 0 — loader smoke (cheapest first).** Confirm the npz loader sees
+the baseline's subjects/epochs before spending GPU on training:
+```bash
+python src/wsmi_loader.py --format npz \
+    --patient_dir data/wsmi_res \
+    --control_dir data/wsmi_res \
+    --diagnosis_csv <patient_labels.csv> \
+    --coords_file  data_scalp/GSN-HydroCel-257.txt
+# expect ~144 subjects, 6-class diagnosis-group counts matching methodology.md
+```
+Watch for: session-id zero-padding (`ses-1` vs `ses-01`) in the CSV
+lookup, and cohort tags resolving (DOC vs control). Adjust
+`--patient_dir/--control_dir` to your actual on-disk split.
+
+**Step 1 — train a GNN on 256 (one GPU job per model):**
+```bash
+sbatch slurm/gridsearch.sbatch   # or run_wsmi_pipeline directly:
+python cookbook/run_wsmi_pipeline.py --stage all --input_mode wsmi \
+    --wsmi_format npz --coords_file data_scalp/GSN-HydroCel-257.txt \
+    --patient_dir data/wsmi_res --control_dir data/wsmi_res \
+    --diagnosis_csv <patient_labels.csv> \
+    --models gae vgae enc_gae_fc --loss mse \
+    --run_name wsmi256_full
+```
+(`enc_gae_fc` needs `--loss cebra`; run it as its own invocation.)
+
+**Step 2 — score against the 0.61 floor (CPU):**
+```bash
+sbatch slurm/gae_latent_eval.sbatch \
+    --run_name wsmi256_full --model_kind gae --eval_mode 5fold --last_n 100 --K 3
+```
+Prints per-fold + pooled `soft_bal_acc_3` and writes
+`output/wsmi256_full/gae_eval_<tag>/{eval_summary.json,per_subject_proba.csv}`.
+Feed the latter to `scripts/compare_roc.py` to drop the GNN into the
+binary-AUC panel next to GMM K=3 / supervised GCN. If the pooled number
+is within noise of 0.611, the encoder recapitulates raw structure; if it
+pulls ahead (especially MCS-vs-UWS AUC / high_doc recall), that's the
+result worth writing up.
+
+---
+
+## 7.6 If nothing beats the floor — the escalation ladder
+
+In priority order (each is a separate, cheap-ish experiment):
+
+1. **CEBRA temporal-contrastive** (enc_gae_fc/cebra) — already implemented,
+   just needs eval. Most likely to help because it keeps the coupling
+   structure MoCo discarded.
+2. **Multi-band node features** — extend node features from theta-only to
+   a 4–5 band wSMI stack (θ/α/β/δ/γ). This is the change most aligned
+   with Sitt 2014's multi-feature requirement and the documented path to
+   cracking the within-DOC ceiling. Touches `wsmi_loader.py` (stack bands
+   into `x`) — `in_channels` becomes `64*n_bands` or a per-node band
+   vector.
+3. **Pretrain-on-all → probe** — pretrain the CEBRA encoder on all ~132k
+   unlabeled epochs, freeze, probe on last_100_balanced. The achievable
+   "use a pretrained encoder" move (no external checkpoint exists for
+   wSMI graphs; EEG foundation models like LaBraM/BrainLM are raw-EEG,
+   not connectivity, and would only apply to the time-series modality).
+4. **Functional adjacency** — replace fixed anatomical k-NN with
+   thresholded per-epoch wSMI edges (ch 5 §5.7 open question); GATv2
+   partly does this by learning edge weights.
+
+---
+
+*See: [chapter 5](./chapter_05_contrastive_pretraining.md) (why
+reconstruction is the wrong loss), [chapter 6](./chapter_06_supervised_and_binary_eval.md)
+(the binary-AUC benchmark this plugs into), [methodology.md](./methodology.md)
+(the leakage-free protocol being reused).*

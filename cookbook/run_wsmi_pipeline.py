@@ -40,7 +40,7 @@ from train import (  # noqa: E402
     apply_normalization, compute_mse_on_graphs,
     compute_normalization_stats, run_ray_tune_wsmi, train_one_epoch,
 )
-from wsmi_loader import load_wsmi_dataset  # noqa: E402
+from wsmi_loader import load_wsmi_dataset, load_wsmi_dataset_npz  # noqa: E402
 from timeseries_loader import load_timeseries_dataset, attach_real_wsmi  # noqa: E402
 from data_loaders import split_by_subject_stratified  # noqa: E402
 from outlier_filter import (  # noqa: E402
@@ -244,7 +244,23 @@ def stage_load(args, out_root: str) -> dict:
     )
     print(f"\n=== STAGE: LOAD ({args.input_mode}, type_data={args.type_data}, "
           f"{cohort_tag}{', subjects=' + str(sorted(subject_filter)) if subject_filter else ''}) ===")
-    if args.input_mode == "wsmi":
+    if args.input_mode == "wsmi" and args.wsmi_format == "npz":
+        # 256-electrode per-session .npz tree (the raw-wSMI baseline data).
+        # patient_dir is the primary tree (may hold both cohorts via
+        # wsmi_res_{DOC,control} tags); control_dir is an optional extra tree.
+        graphs, subjects, dgroups = load_wsmi_dataset_npz(
+            data_dir=args.patient_dir,
+            control_dir=None if args.patients_only else args.control_dir,
+            include_controls=not args.patients_only,
+            diagnosis_csv=args.diagnosis_csv,
+            coords_file=args.coords_file,
+            k=args.k,
+            subject_filter=subject_filter,
+            granularity=args.diagnosis_granularity,
+            max_epochs_per_recording=args.max_epochs_per_recording,
+            seed=args.seed,
+        )
+    elif args.input_mode == "wsmi":
         graphs, subjects, dgroups = load_wsmi_dataset(
             patient_dir=args.patient_dir,
             control_dir=None if args.patients_only else args.control_dir,
@@ -1018,6 +1034,12 @@ def main():
                         choices=["wsmi", "timeseries"],
                         help="Node-feature modality: pre-computed wSMI matrices "
                              "or raw per-electrode time-series.")
+    parser.add_argument("--wsmi_format", default="pkl", choices=["pkl", "npz"],
+                        help="wSMI on-disk format (input_mode=wsmi only): 'pkl' = "
+                             "junifer biosemi64 (1,n,64,64); 'npz' = per-session "
+                             "256-electrode tree (n,256,256), e.g. data/wsmi_res. "
+                             "Use 'npz' with --coords_file GSN-HydroCel-257.txt for "
+                             "the fair 256-node comparison (see chapter_07).")
     parser.add_argument("--type_data", default="rs", choices=["lg", "rs"],
                         help="Dataset/task: 'lg' (local-global) or 'rs' (resting-state). "
                              "Sets default data dirs. Timeseries epochs are cropped to "
