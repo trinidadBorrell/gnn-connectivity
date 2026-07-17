@@ -131,6 +131,19 @@ python scripts/compare_roc.py \
 - *MoCo augmentation-contrastive* (ch 5/6) — underperformed; augmentation invariance
   discards the discriminative coupling structure. CEBRA's *temporal* positives avoid this.
 
+**Sweep detail + robustness (why the config is a real optimum, not luck):**
+
+- *latent_dim* (GMM K=6 readout): 8→**0.499**, 16→**0.522**, 32→**0.623**,
+  64→**0.536**, 128→**0.561**. Clean peak at **d=32**; the frozen-MLP probe agrees
+  (d=32→**0.673**, d=64→**0.566**). Bigger latents hurt — the L2-normalized
+  contrastive embedding gets too sparse for 3-class structure.
+- *temperature* (fixed): 0.05/0.1/0.2 → the best is **τ=0.1** (d=32, K=6: 0.522 /
+  0.623 / 0.549). τ=1.0 default is far too soft.
+- *seed robustness* (frozen-MLP probe, d=32): seed 42 → **0.673 ± 0.070**,
+  seed 7 → **0.647 ± 0.120**. Robust 3-class estimate ≈ **0.66**, comfortably above
+  the 0.611 baseline and the 0.623 GMM readout. The **control-vs-DOC 0.940** headline
+  is the seed-42 number (few controls/fold → single-seed; worth a LOOCV confirm).
+
 *Caveats:* control-vs-DOC has few controls/fold (n_pos 2–4), so read +0.06 as
 "improvement with overlapping bands"; the direction + tighter variance are
 consistent. In the saved figure CEBRA was relabeled from the `--moco` slot via
