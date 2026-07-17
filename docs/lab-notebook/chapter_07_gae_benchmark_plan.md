@@ -77,6 +77,23 @@ last-100 epochs/session:**
 | CEBRA (frozen) + GMM K=6 | 0.623 ± 0.057 | 0.877 ± 0.085 | 0.660 ± 0.065 |
 | GMM K=3 on raw wSMI (baseline) | 0.611 ± 0.131 | 0.815 ± 0.095 | 0.713 ± 0.155 |
 
+> **⚠️ Cohort control (read with the table above).** The GNN runs above used the
+> pipeline default `--diagnosis_granularity coarse`, which DROPS EMCS+COMA → a
+> **127-subject** cohort, whereas the raw-wSMI baseline (0.611/0.815/0.713) is on
+> **144 subjects**. So the 0.940-vs-0.815 in the table is NOT cohort-matched. We
+> re-ran the baseline on the same 127 subjects (`--exclude_dx EMCS,COMA`) and the
+> GNN on the full 144 (`--diagnosis_granularity fine`). **On the identical
+> 127-subject cohort** the GNN still wins clearly:
+>
+> | 127-cohort | 3-class | control-vs-DOC | MCS-vs-UWS |
+> |---|---|---|---|
+> | raw-wSMI GMM baseline | 0.551 | 0.810 ± 0.076 | 0.680 ± 0.104 |
+> | CEBRA frozen + MLP probe | **0.673** | **0.940 ± 0.067** | 0.693 ± 0.057 |
+>
+> The baseline's control-vs-DOC AUC is ≈0.81 on BOTH cohorts (0.815@144, 0.810@127)
+> → the GNN's +0.13 is a real representation gain, not a cohort artifact. The GNN
+> retrained on the full 144 cohort (job 373415) is the last pending confirmation.
+
 **The winning pipeline** = *contrastive pretrain → freeze → supervised MLP probe*:
 
 1. **Data.** 256-electrode wSMI-theta `.npz` tree (`data/wsmi_res`), loaded via

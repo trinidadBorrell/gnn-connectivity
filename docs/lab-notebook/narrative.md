@@ -3,12 +3,14 @@
 > **Status (2026-07-17):** working narrative that structures the full paper and
 > records every method exactly. Numbers are drawn from the lab-notebook chapters
 > (raw-wSMI baseline) and the chapter-7 GNN experiments, all verified against the
-> code (see `§0 Provenance & caveats`). **One correction is in flight:** the GNN
-> runs were trained on a 127-subject cohort (EMCS+COMA silently dropped by the
-> loader's default `coarse` granularity); a cohort-matched 144-subject re-run
-> (`--diagnosis_granularity fine`, SLURM job 373415) is running and the GNN
-> headline AUCs will be updated from it. GNN numbers below are flagged
-> **[127-cohort, preliminary]** until then.
+> code (see `§0 Provenance & caveats`). **Cohort control resolved:** the GNN
+> pipeline's default `coarse` granularity had dropped EMCS+COMA → a 127-subject
+> cohort vs the baseline's 144. We therefore ran **both methods on both cohorts**
+> (§4.5). On the *identical* 127-subject cohort the GNN clearly beats the baseline
+> (control-vs-DOC 0.940 vs 0.810; 3-class 0.673 vs 0.551), and the baseline's AUC
+> is unchanged across cohorts — so the GNN edge is real, not an artifact. The only
+> number still pending is the **GNN retrained on the full 144-cohort** (fine
+> granularity, job 373415), which will complete the 2×2.
 
 ---
 
@@ -63,9 +65,10 @@ Engemann et al. 2018, *Brain*). We use **theta-band wSMI only**.
    unseen patients (held-out 3-class balanced accuracy ≈ 0.59–0.61).
 2. **A learned self-supervised graph representation.** A contrastive (CEBRA-style)
    graph encoder, **frozen**, with a lightweight supervised MLP probe, is the
-   best representation we found: on the conscious/unconscious axis it matches or
-   exceeds both the hand-engineered baseline and a fully-supervised GCN
-   **[127-cohort, preliminary — cohort-matched re-run in flight]**.
+   best representation we found: on the identical 127-subject cohort it beats the
+   hand-engineered baseline on the conscious/unconscious axis (control-vs-DOC AUC
+   0.940 vs 0.810) and equals the fully-supervised GCN (0.931), with tighter
+   variance (144-cohort confirmation in flight).
 3. **A hard ceiling within DOC.** No method (unsupervised, supervised, or
    self-supervised) exceeds ~0.66–0.72 AUC on MCS-vs-UWS from theta-wSMI alone,
    pinpointing multi-band features as the necessary next ingredient.
@@ -255,30 +258,45 @@ consciousness. Every non-T–T pair has stronger coupling in the conscious clust
 This reproduces Sitt 2014 (centro-posterior), King 2013 (long-range
 posterior→frontal), and Casarotto 2016 (posterior hot zone) — **without labels.**
 
-### 4.5 The learned representation — GNN results **[127-cohort, preliminary]**
-> ⚠️ These numbers were computed on the 127-subject cohort (EMCS+COMA dropped by
-> the loader default). The **cohort-matched 144-subject re-run (job 373415)** is
-> in flight; replace the AUCs below with its output. The *qualitative* findings
-> (relative ordering, optima) are expected to hold.
+### 4.5 The learned representation — GNN results
 
-**Readout comparison on the tuned CEBRA encoder (latent_dim=32, τ=0.1):**
+**The cohort control (essential to the claim).** The GNN pipeline's default
+`coarse` granularity silently dropped EMCS+COMA → a **127-subject cohort**, while
+the baseline used **144 subjects** (§3.1). Comparing GNN-127 to baseline-144 would
+be confounded. We therefore ran **both methods on both cohorts** (baseline with
+`--exclude_dx EMCS,COMA`; GNN with `--diagnosis_granularity fine`). The 127-cohort
+comparison is complete; the GNN-144 cell is the final in-flight run (job 373415).
 
-| readout | 3-class bal_acc | control-vs-DOC AUC | MCS-vs-UWS AUC |
+**Cohort-controlled 2×2 — frozen CEBRA (d=32, τ=0.1) + MLP probe vs raw-wSMI GMM:**
+
+| | 3-class bal_acc | control-vs-DOC AUC | MCS-vs-UWS AUC |
 |---|---|---|---|
-| raw-wSMI baseline (144-subj) | 0.611 ± 0.131 | 0.815 ± 0.095 | 0.713 ± 0.155 |
-| CEBRA frozen + GMM K=6 | 0.623 ± 0.057 | 0.877 ± 0.085 | 0.660 ± 0.065 |
-| **CEBRA frozen + MLP probe** | **0.673 ± 0.070** | **0.940 ± 0.067** | 0.693 ± 0.057 |
-| CEBRA full fine-tune | 0.406 ± 0.103 (collapse) | — | — |
-| Supervised GCN (144-subj) | 0.527 | 0.931 ± 0.083 | 0.678 ± 0.155 |
+| **Baseline, 144-cohort** | 0.611 ± 0.131 | 0.815 ± 0.095 | 0.713 ± 0.155 |
+| **Baseline, 127-cohort** | 0.551 | 0.810 ± 0.076 | 0.680 ± 0.104 |
+| **GNN, 127-cohort** | **0.673 ± 0.070** | **0.940 ± 0.067** | 0.693 ± 0.057 |
+| **GNN, 144-cohort** | *pending (373415)* | *pending* | *pending* |
+| Supervised GCN, 144 | 0.527 | 0.931 ± 0.083 | 0.678 ± 0.155 |
 
-Qualitative findings (robust):
-- **Freeze, don't fine-tune.** The frozen encoder + trained MLP head is the best
-  readout; **full end-to-end fine-tuning collapses** (0.41) — small-data
-  overfitting of ~50k encoder params on ~127 subjects.
+**Key reading — the GNN edge is real, not a cohort artifact.** On the *identical*
+127-subject cohort the GNN beats the baseline on every axis: **control-vs-DOC
+0.940 vs 0.810 (+0.13)** and **3-class 0.673 vs 0.551 (+0.12)**; MCS-vs-UWS is a
+tie at the ceiling (0.693 vs 0.680). Crucially, **the baseline's control-vs-DOC
+AUC is ≈0.81 on both cohorts** (0.815 at 144, 0.810 at 127), so dropping EMCS/COMA
+did not inflate it — the GNN's 0.940 reflects a genuinely better representation.
+(Dropping EMCS/COMA *lowered* the baseline 3-class from 0.611 to 0.551, because it
+removes the very-distinct COMA and near-conscious EMCS, leaving a muddier middle.)
+
+**Readout ablation (all within the 127-cohort, so internally valid):**
+
+| readout on CEBRA d=32 | 3-class bal_acc |
+|---|---|
+| CEBRA frozen + GMM K=6 | 0.623 ± 0.057 |
+| **CEBRA frozen + MLP probe** | **0.673 ± 0.070** |
+| CEBRA full fine-tune | 0.406 ± 0.103 (collapse) |
+
+- **Freeze, don't fine-tune.** Full end-to-end fine-tuning collapses (0.41) —
+  small-data overfitting of ~50k encoder params on ~127 subjects.
 - **A trained probe beats clustering the representation** (0.673 vs 0.623 GMM).
-- On control-vs-DOC the frozen probe reaches the top of the field
-  **[cohort-matched value pending]**; on MCS-vs-UWS it sits at the universal
-  ceiling but with the tightest variance.
 
 **Characterised optimum (127-cohort ablations, robust):**
 - **latent_dim** (GMM K=6): 8→0.499, 16→0.522, **32→0.623**, 64→0.536, 128→0.561 —
