@@ -18,3 +18,5 @@ logs/
 tests/
 output_old/
 slurm/logs/
+cookbook/
+wsmi_res_control/

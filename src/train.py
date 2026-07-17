@@ -26,7 +26,42 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import os
 from datetime import datetime
-from model import GAE, VGAE, kl_divergence
+from model import GAE, GAEVAE, GATVAE, VGAE, GNNEncoder, GATEncoder, kl_divergence
+from correlation_loss import corr_loss
+
+
+def _select_model_class(model_kind: str):
+    """Map a model_kind string to its class. Raises on unknown values."""
+    table = {"gae": GAE, "vgae": VGAE, "gae_vae": GAEVAE, "gat_vae": GATVAE,
+             "enc_gae_fc": GNNEncoder, "enc_gat_fc": GATEncoder}
+    try:
+        return table[model_kind]
+    except KeyError:
+        raise ValueError(
+            f"unknown model_kind={model_kind!r}; expected one of {sorted(table)}"
+        )
+
+
+def _is_variational(model_kind: str) -> bool:
+    """VGAE, GAEVAE and GATVAE all have a variational bottleneck (return mu/log_var)."""
+    return model_kind in ("vgae", "gae_vae", "gat_vae")
+
+
+def build_decoder_model(model_kind, in_channels, config):
+    """Instantiate a decoder/encoder model from a config dict.
+
+    Only gat_vae takes the extra ``heads`` attention hyperparameter; the other
+    classes share the (in_channels, hidden_dims, latent_dim, dropout) contract.
+    """
+    ModelCls = _select_model_class(model_kind)
+    kwargs = dict(
+        hidden_dims=config["hidden_dims"],
+        latent_dim=config["latent_dim"],
+        dropout=config["dropout"],
+    )
+    if model_kind in ("gat_vae", "enc_gat_fc") and config.get("heads") is not None:
+        kwargs["heads"] = config["heads"]
+    return ModelCls(in_channels, **kwargs)
 
 try:
     import psutil
@@ -178,52 +213,52 @@ def normalize_graph_features(graph_list):
 def compute_mse_on_graphs(model, graph_list, device=None, batch_size=64, variational=False):
     """Compute average MSE reconstruction error on a list of graphs.
 
-    For variational models, uses mu deterministically (model.eval() also disables
-    reparameterization sampling inside VGAE). The `variational` flag is kept for
-    API symmetry — model.eval() already does the right thing.
+    Iterates one graph at a time and explicitly moves tensors to the target
+    device. This sidesteps two MPS-on-macOS issues that bite the PyG DataLoader:
+      1. `_share_filename_` fails when num_workers > 0 and any tensor is on MPS.
+      2. `torch.cat()` during batch collation fails if graphs have mixed
+         device state (e.g. after a prior training phase touched some of them).
+    For variational models, model.eval() already disables sampling.
     """
-    from torch_geometric.loader import DataLoader as PyGDataLoader
-
     if device is None:
         device = torch.device('cpu')
 
     model.eval()
     criterion = torch.nn.MSELoss()
     total_loss = 0.0
-    num_batches = 0
-
-    # Larger batch size for evaluation (no gradients = less memory)
-    loader = PyGDataLoader(graph_list, batch_size=batch_size, shuffle=False,
-                           num_workers=2, pin_memory=True)
+    n = 0
 
     with torch.no_grad():
-        for batch in loader:
-            batch = batch.to(device, non_blocking=True)
-            out = model(batch.x, batch.edge_index)
+        for g in graph_list:
+            x = g.x.to(device)
+            edge_index = g.edge_index.to(device)
+            out = model(x, edge_index)
             x_recon = out[0]
-            loss = criterion(x_recon, batch.x)
-            total_loss += loss.item()
-            num_batches += 1
+            total_loss += float(criterion(x_recon, x))
+            n += 1
 
-    return total_loss / num_batches if num_batches > 0 else 0.0
+    return total_loss / n if n > 0 else 0.0
 
 
 def train_one_epoch(model, optimizer, criterion, loader, device=None,
-                    variational=False, beta=0.0):
+                    variational=False, beta=0.0, corr_lambda=0.0):
     """Train model for one epoch using a pre-built PyG DataLoader.
 
     Args:
-        model: The model to train (GAE or VGAE)
+        model: The model to train (GAE, VGAE, or GAEVAE)
         optimizer: Optimizer
-        criterion: Loss function (reconstruction)
+        criterion: Loss function (reconstruction MSE)
         loader: Pre-created PyG DataLoader (created once, reused every epoch)
         device: Device to use
         variational: If True, expect model to return (x_recon, z, mu, log_var) and
                     add `beta * KL(q(z|x) || N(0,I))` to the loss.
         beta: Weight on the KL term (typically ramped via KL warm-up).
+        corr_lambda: Weight on the Pearson-correlation-preservation regularizer.
+            If > 0, adds `corr_lambda * MSE(corr(x_recon), corr(x))` to the loss.
 
     Returns:
-        (avg_total_loss, avg_recon_loss, avg_kl).  avg_kl is 0.0 for non-variational.
+        (avg_total_loss, avg_recon_loss, avg_kl, avg_corr).
+        avg_kl is 0.0 for non-variational; avg_corr is 0.0 when corr_lambda == 0.
     """
     if device is None:
         device = torch.device('cpu')
@@ -232,6 +267,7 @@ def train_one_epoch(model, optimizer, criterion, loader, device=None,
     total_loss = 0.0
     total_recon = 0.0
     total_kl = 0.0
+    total_corr = 0.0
     num_batches = 0
 
     for batch in loader:
@@ -240,14 +276,18 @@ def train_one_epoch(model, optimizer, criterion, loader, device=None,
         out = model(batch.x, batch.edge_index)
         x_recon = out[0]
         recon_loss = criterion(x_recon, batch.x)
+        loss = recon_loss
 
         if variational:
             mu, log_var = out[2], out[3]
             kl = kl_divergence(mu, log_var)
-            loss = recon_loss + beta * kl
+            loss = loss + beta * kl
             total_kl += kl.item()
-        else:
-            loss = recon_loss
+
+        if corr_lambda > 0:
+            c_loss = corr_loss(batch.x, x_recon, num_graphs=batch.num_graphs)
+            loss = loss + corr_lambda * c_loss
+            total_corr += c_loss.item()
 
         loss.backward()
         optimizer.step()
@@ -256,8 +296,9 @@ def train_one_epoch(model, optimizer, criterion, loader, device=None,
         num_batches += 1
 
     if num_batches == 0:
-        return 0.0, 0.0, 0.0
-    return total_loss / num_batches, total_recon / num_batches, total_kl / num_batches
+        return 0.0, 0.0, 0.0, 0.0
+    return (total_loss / num_batches, total_recon / num_batches,
+            total_kl / num_batches, total_corr / num_batches)
 
 
 def _build_hidden_dims(num_layers):
@@ -315,7 +356,7 @@ def ray_trainable(config, train_graphs=None, val_graphs=None):
         else:
             beta = 0.0
 
-        total_loss, recon_loss, kl_loss = train_one_epoch(
+        total_loss, recon_loss, kl_loss, _corr_loss = train_one_epoch(
             model, optimizer, criterion, train_loader, device=device,
             variational=variational, beta=beta,
         )
@@ -340,6 +381,268 @@ def ray_trainable(config, train_graphs=None, val_graphs=None):
 
         if patience is not None and epochs_since_improve >= patience:
             break
+
+
+def ray_trainable_wsmi(config, train_graphs=None, val_graphs=None):
+    """Ray Tune trainable for the wSMI / time-series pipeline.
+
+    Wider search space than ray_trainable: hidden_dims, batch_size,
+    weight_decay, KL warmup, beta_kl, corr_lambda, and model_kind are all tunable.
+    Uses a PyG DataLoader so trials respect the searched batch_size.
+    """
+    from ray import tune as ray_tune
+    from torch_geometric.loader import DataLoader as PyGDataLoader
+
+    in_channels = config["in_channels"]
+    latent_dim = config["latent_dim"]
+    hidden_dims = config["hidden_dims"]
+    dropout = config["dropout"]
+    lr = config["lr"]
+    weight_decay = config.get("weight_decay", 0.0)
+    batch_size = config.get("batch_size", 64)
+    n_epochs = config.get("n_epochs", 80)
+    model_kind = config.get("model_kind",
+                            "vgae" if config.get("variational", False) else "gae")
+    variational = _is_variational(model_kind)
+    beta_max = config.get("beta_kl", 1.0)
+    kl_warmup_epochs = config.get("kl_warmup_epochs", 10)
+    corr_lambda = config.get("corr_lambda", 0.0)
+
+    model = build_decoder_model(model_kind, in_channels, config)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=lr, weight_decay=weight_decay)
+    criterion = torch.nn.MSELoss()
+
+    loader = PyGDataLoader(train_graphs, batch_size=batch_size,
+                           shuffle=True, num_workers=config.get("num_workers", 0))
+
+    for epoch in range(n_epochs):
+        if variational:
+            beta = beta_max * min(1.0, epoch / max(1, kl_warmup_epochs))
+        else:
+            beta = 0.0
+        total_loss, recon_loss, kl_loss, c_loss = train_one_epoch(
+            model, optimizer, criterion, loader,
+            variational=variational, beta=beta, corr_lambda=corr_lambda,
+        )
+        val_mse = compute_mse_on_graphs(model, val_graphs,
+                                        variational=variational)
+        ray_tune.report({
+            "val_mse": val_mse,
+            "train_loss": total_loss,
+            "recon_loss": recon_loss,
+            "kl_loss": kl_loss,
+            "corr_loss": c_loss,
+            "beta": beta,
+            "epoch": epoch,
+        })
+
+
+def random_search_wsmi(train_graphs, val_graphs, in_channels,
+                       model_kind="gae", num_samples=20, n_epochs=80,
+                       corr_lambda_search=False, seed=0, reduction_factor=3,
+                       num_workers=0):
+    """Ray-free hyperparameter search over the SAME space as run_ray_tune_wsmi.
+
+    Used as a fallback when Ray is not installed (e.g. the ppc64le env, which has
+    no Ray wheels). Draws `num_samples` random configs, trains each for
+    `n_epochs`, and keeps the one with the lowest best-epoch val MSE. Returns the
+    same `(best_config dict, trials_df)` contract as run_ray_tune_wsmi so the
+    caller (stage_tune) is unchanged.
+    """
+    import random as _random
+    import math as _math
+    import pandas as _pd
+    from torch_geometric.loader import DataLoader as PyGDataLoader
+
+    rng = _random.Random(seed)
+    variational = _is_variational(model_kind)
+    device = torch.device("cuda:0") if torch.cuda.is_available() else (
+        torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu"))
+
+    HIDDEN_CHOICES = [[64, 32], [64, 64, 32], [64, 64, 32, 16]]
+
+    def _loguniform(a, b):
+        return _math.exp(rng.uniform(_math.log(a), _math.log(b)))
+
+    def _sample():
+        cfg = {
+            "in_channels": in_channels,
+            "latent_dim": rng.choice([2, 4, 8, 16, 32]),
+            "hidden_dims": rng.choice(HIDDEN_CHOICES),
+            "lr": _loguniform(1e-4, 5e-3),
+            "dropout": rng.uniform(0.0, 0.4),
+            "batch_size": rng.choice([32, 64]),
+            "weight_decay": _loguniform(1e-6, 1e-3),
+            "n_epochs": n_epochs,
+            "model_kind": model_kind,
+            "variational": variational,
+        }
+        if variational:
+            cfg["beta_kl"] = rng.choice([0.001, 0.01, 0.1, 1.0])
+            cfg["kl_warmup_epochs"] = rng.choice([0, 10, 30])
+        if model_kind == "gat_vae":
+            cfg["heads"] = rng.choice([2, 4, 8])
+        if corr_lambda_search:
+            cfg["corr_lambda"] = _loguniform(1e-2, 1e1)
+        return cfg
+
+    # Multi-fidelity successive halving (ASHA-style): start all `num_samples`
+    # configs, train each for a short "rung" budget, keep the best 1/eta, give the
+    # survivors a larger budget, repeat. This gets the search breadth of
+    # `num_samples` at roughly the cost of a handful of full trainings — the key
+    # lever that made the un-pruned 30-trial search on the big datasets too slow.
+    eta = max(2, int(reduction_factor))
+    min_epochs = max(2, n_epochs // (eta * eta))   # smallest rung budget
+    criterion = torch.nn.MSELoss()
+
+    print(f"[tune {model_kind}] successive-halving: {num_samples} configs, "
+          f"eta={eta}, rung0={min_epochs} -> max {n_epochs} epochs on {device}")
+
+    states = []
+    for cfg in (_sample() for _ in range(num_samples)):
+        model = build_decoder_model(model_kind, in_channels, cfg).to(device)
+        states.append({
+            "cfg": cfg,
+            "model": model,
+            "opt": torch.optim.AdamW(model.parameters(), lr=cfg["lr"],
+                                     weight_decay=cfg["weight_decay"]),
+            "loader": PyGDataLoader(train_graphs, batch_size=cfg["batch_size"],
+                                    shuffle=True, num_workers=num_workers),
+            "epochs": 0, "best": float("inf"),
+        })
+
+    def _train_to(st, budget):
+        cfg = st["cfg"]
+        beta_max = cfg.get("beta_kl", 1.0)
+        kl_warmup = cfg.get("kl_warmup_epochs", 10)
+        corr_lambda = cfg.get("corr_lambda", 0.0)
+        while st["epochs"] < budget:
+            ep = st["epochs"]
+            beta = beta_max * min(1.0, ep / max(1, kl_warmup)) if variational else 0.0
+            train_one_epoch(st["model"], st["opt"], criterion, st["loader"],
+                            device=device, variational=variational, beta=beta,
+                            corr_lambda=corr_lambda)
+            vm = float(compute_mse_on_graphs(st["model"], val_graphs, device=device,
+                                             variational=variational))
+            st["best"] = min(st["best"], vm)
+            st["epochs"] = ep + 1
+
+    alive, budget = states, min(min_epochs, n_epochs)
+    while True:
+        for st in alive:
+            _train_to(st, budget)
+        if budget >= n_epochs or len(alive) <= 1:
+            break
+        alive = sorted(alive, key=lambda s: s["best"])[:max(1, len(alive) // eta)]
+        budget = min(n_epochs, budget * eta)
+
+    rows = []
+    for i, st in enumerate(states):
+        row = {k: v for k, v in st["cfg"].items() if k != "in_channels"}
+        row.update(trial=i, val_mse=st["best"], epochs_trained=st["epochs"])
+        rows.append(row)
+    best_state = min(states, key=lambda s: s["best"])
+    best_cfg, best_mse = dict(best_state["cfg"]), best_state["best"]
+
+    best_cfg["val_mse"] = best_mse
+    print(f"\nBest config: {best_cfg}")
+    print(f"Best val MSE: {best_mse:.6f}")
+    return best_cfg, _pd.DataFrame(rows)
+
+
+def run_ray_tune_wsmi(train_graphs, val_graphs, in_channels,
+                      model_kind="gae", num_samples=20, n_epochs=80,
+                      grace_period=10, cpus_per_trial=2,
+                      storage_path=None, corr_lambda_search=False,
+                      max_concurrent_trials=None, num_workers=0):
+    """Wider ASHA search for the wSMI / time-series pipeline.
+
+    Args:
+        model_kind: one of {"gae", "vgae", "gae_vae"} — picks the model class and
+            whether to tune KL-related hyperparameters.
+        corr_lambda_search: if True, tune the Pearson-correlation regularizer
+            weight in the search space (use in time-series mode).
+    Returns best config dict + analysis dataframe.
+
+    Falls back to a Ray-free random search (random_search_wsmi) when Ray is not
+    importable, so the pipeline runs on environments without Ray wheels.
+    """
+    try:
+        import ray
+        from ray import tune
+        from ray.tune.schedulers import ASHAScheduler
+    except ImportError:
+        print("[tune] Ray not available -> Ray-free random-search fallback")
+        return random_search_wsmi(
+            train_graphs, val_graphs, in_channels, model_kind=model_kind,
+            num_samples=num_samples, n_epochs=n_epochs,
+            corr_lambda_search=corr_lambda_search, num_workers=num_workers)
+
+    variational = _is_variational(model_kind)
+
+    src_dir = os.path.dirname(os.path.abspath(__file__))
+    if not ray.is_initialized():
+        ray.init(
+            runtime_env={"env_vars": {"PYTHONPATH": src_dir}},
+            ignore_reinit_error=True,
+            log_to_driver=True,
+        )
+
+    HIDDEN_CHOICES = [[64, 32], [64, 64, 32], [64, 64, 32, 16]]
+    search_space = {
+        "in_channels": in_channels,
+        "latent_dim": tune.choice([2, 4, 8, 16, 32]),
+        "hidden_dims": tune.choice(HIDDEN_CHOICES),
+        "lr": tune.loguniform(1e-4, 5e-3),
+        "dropout": tune.uniform(0.0, 0.4),
+        "batch_size": tune.choice([32, 64]),
+        "weight_decay": tune.loguniform(1e-6, 1e-3),
+        "n_epochs": n_epochs,
+        "model_kind": model_kind,
+        "num_workers": num_workers,
+        # kept for backward compat with callers that still read 'variational'
+        "variational": variational,
+    }
+    if variational:
+        search_space["beta_kl"] = tune.choice([0.001, 0.01, 0.1, 1.0])
+        search_space["kl_warmup_epochs"] = tune.choice([0, 10, 30])
+    if model_kind == "gat_vae":
+        search_space["heads"] = tune.choice([2, 4, 8])
+    if corr_lambda_search:
+        search_space["corr_lambda"] = tune.loguniform(1e-2, 1e1)
+
+    scheduler = ASHAScheduler(
+        time_attr="epoch", max_t=n_epochs,
+        grace_period=grace_period, reduction_factor=2,
+    )
+    trainable = tune.with_parameters(
+        ray_trainable_wsmi, train_graphs=train_graphs, val_graphs=val_graphs,
+    )
+    # max_concurrent_trials caps how many trials run at once. Each concurrent trial
+    # deserializes its OWN copy of train/val graphs from the object store, so peak
+    # RAM ~ dataset_size * (1 + max_concurrent_trials). Cap it on memory-limited
+    # machines (None = let Ray use all cpus / cpus_per_trial).
+    tune_config = tune.TuneConfig(
+        metric="val_mse", mode="min", scheduler=scheduler,
+        num_samples=num_samples,
+        max_concurrent_trials=max_concurrent_trials,  # None = unlimited
+    )
+    run_config_kwargs = {"name": f"wsmi_{model_kind}_asha"}
+    if storage_path is not None:
+        run_config_kwargs["storage_path"] = os.path.abspath(storage_path)
+    tuner = tune.Tuner(
+        tune.with_resources(trainable, resources={"cpu": cpus_per_trial}),
+        param_space=search_space,
+        tune_config=tune_config,
+        run_config=tune.RunConfig(**run_config_kwargs),
+    )
+    results = tuner.fit()
+    best = results.get_best_result(metric="val_mse", mode="min")
+    df = results.get_dataframe()
+    print("\nBest config:", best.config)
+    print("Best val MSE:", best.metrics.get("val_mse"))
+    return best.config, df
 
 
 def run_ray_tune(train_graphs, val_graphs, in_channels, num_samples=10,
@@ -693,7 +996,7 @@ class TrainGAE:
             else:
                 beta = 0.0
 
-            train_loss, recon_loss, kl_loss = train_one_epoch(
+            train_loss, recon_loss, kl_loss, _corr_loss = train_one_epoch(
                 model, optimizer, criterion, train_loader, device=device,
                 variational=variational, beta=beta,
             )
