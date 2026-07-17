@@ -77,22 +77,25 @@ last-100 epochs/session:**
 | CEBRA (frozen) + GMM K=6 | 0.623 ± 0.057 | 0.877 ± 0.085 | 0.660 ± 0.065 |
 | GMM K=3 on raw wSMI (baseline) | 0.611 ± 0.131 | 0.815 ± 0.095 | 0.713 ± 0.155 |
 
-> **⚠️ Cohort control (read with the table above).** The GNN runs above used the
-> pipeline default `--diagnosis_granularity coarse`, which DROPS EMCS+COMA → a
-> **127-subject** cohort, whereas the raw-wSMI baseline (0.611/0.815/0.713) is on
-> **144 subjects**. So the 0.940-vs-0.815 in the table is NOT cohort-matched. We
-> re-ran the baseline on the same 127 subjects (`--exclude_dx EMCS,COMA`) and the
-> GNN on the full 144 (`--diagnosis_granularity fine`). **On the identical
-> 127-subject cohort** the GNN still wins clearly:
+> **⚠️ COHORT CORRECTION (the 127 table above is NOT cohort-matched; see the
+> corrected 144 numbers below and in [narrative.md §4.5](./narrative.md)).** The GNN
+> runs used the pipeline default `--diagnosis_granularity coarse`, which DROPS
+> EMCS+COMA → a **127-subject** cohort, whereas the baseline/supervised numbers are
+> on **144 subjects**. So "0.940 beats supervised 0.931" was confounded (CEBRA-127
+> vs supervised-144). We re-ran **every method on both cohorts**. Corrected,
+> cohort-matched results:
 >
-> | 127-cohort | 3-class | control-vs-DOC | MCS-vs-UWS |
+> | frozen probe, 3-class / ctrl-vs-DOC | Baseline | CEBRA | Supervised GCN |
 > |---|---|---|---|
-> | raw-wSMI GMM baseline | 0.551 | 0.810 ± 0.076 | 0.680 ± 0.104 |
-> | CEBRA frozen + MLP probe | **0.673** | **0.940 ± 0.067** | 0.693 ± 0.057 |
+> | **144-cohort (matched)** | 0.611 / 0.815 | **0.678** / 0.901 | 0.527 / **0.931** |
+> | 127-cohort | 0.551 / 0.810 | 0.673 / 0.940 | — |
 >
-> The baseline's control-vs-DOC AUC is ≈0.81 on BOTH cohorts (0.815@144, 0.810@127)
-> → the GNN's +0.13 is a real representation gain, not a cohort artifact. The GNN
-> retrained on the full 144 cohort (job 373415) is the last pending confirmation.
+> **Corrected reading:** on the matched 144-cohort CEBRA has the **best 3-class
+> (0.678)** and **beats the unsupervised baseline on control-vs-DOC (0.901 vs
+> 0.815)**, but the **supervised GCN wins control-vs-DOC alone (0.931)** — CEBRA is
+> ~97 % of it while keeping the 3-class balance the supervised model loses. The GNN
+> beats the baseline on BOTH cohorts and is more cohort-robust. The 0.940 figure is
+> the 127-cohort value; **use the 144 row as the headline.**
 
 **The winning pipeline** = *contrastive pretrain → freeze → supervised MLP probe*:
 

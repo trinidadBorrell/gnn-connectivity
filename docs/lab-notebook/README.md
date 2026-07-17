@@ -107,20 +107,20 @@ If the GAE matches or barely exceeds these, the learned representation
 is recapitulating raw-wSMI structure. If it pulls notably ahead, we've
 found a useful encoding.
 
-> **UPDATE (2026-07-17) — the learned GNN cleared the bar (cohort-controlled).**
+> **UPDATE (2026-07-17) — the learned GNN cleared the bar (cohort-matched).**
 > A **CEBRA contrastive graph encoder (frozen) + a supervised MLP probe** is the
-> best representation found. Because the GNN pipeline default dropped EMCS+COMA
-> (127 subjects) vs the baseline's 144, we compared **both methods on both
-> cohorts**: on the **identical 127-subject cohort** the GNN beats the raw-wSMI
-> GMM baseline — **control-vs-DOC AUC 0.940 vs 0.810, 3-class 0.673 vs 0.551** —
-> and the baseline's AUC is ≈0.81 on both cohorts, so the edge is a real
-> representation gain, not a cohort artifact. It also equals the fully-supervised
-> GCN (0.931) with tighter variance. MCS-vs-UWS stays at the ~0.69 ceiling for all
-> methods (multi-band still needed). The GNN-144 confirmation run is in flight.
-> Full recipe + exact hyperparameters + reproduction commands in
-> [chapter 7 §7.8–7.9](./chapter_07_gae_benchmark_plan.md#79-sota-summary--exact-reproduction-recipe).
-> Winning config: `enc_gae_fc`/CEBRA, `latent_dim=32`, `temperature=0.1`
-> (fixed), frozen encoder + 2-layer MLP head, class-weighted CE.
+> best-overall model. Compared on the **matched 144-subject cohort** (all methods,
+> same subjects): CEBRA has the **best 3-class balanced accuracy 0.678** (baseline
+> 0.611, supervised GCN 0.527) and **beats the unsupervised baseline on
+> control-vs-DOC (0.901 vs 0.815)**, reaching ~97 % of the supervised GCN's AUC
+> (0.931) on that axis while keeping the 3-class balance the supervised model
+> loses. It also beats the baseline on the 127-cohort (0.673/0.940 vs 0.551/0.810)
+> and is more cohort-robust. MCS-vs-UWS stays at the ~0.69 ceiling for all methods
+> (multi-band still needed). Full corrected results + exact hyperparameters +
+> reproduction in [chapter 7 §7.8–7.9](./chapter_07_gae_benchmark_plan.md) and
+> [narrative.md §4.5](./narrative.md). Winning config: `enc_gae_fc`/CEBRA,
+> `latent_dim=32`, `temperature=0.1` (fixed), frozen encoder + 2-layer MLP head,
+> class-weighted CE.
 
 ---
 
