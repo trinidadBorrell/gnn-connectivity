@@ -50,10 +50,12 @@ COARSE_TO_IDX = {c: i for i, c in enumerate(COARSE_ORDER)}
 # --------------------------------------------------------------------- dataset
 class WsmiSupervised(Dataset):
     """Same preload pattern as WsmiEpochs; also returns the per-epoch coarse label."""
-    def __init__(self, data_dir: str, labels_csv: str, allowed_subjects: set):
+    def __init__(self, data_dir: str, labels_csv: str, allowed_subjects):
+        # allowed_subjects=None -> keep ALL subjects (144-cohort run); else filter.
         sessions = EEGtoGraph.enumerate_matrix_sessions(data_dir)
         sessions = [(sid, snum, src) for sid, snum, src in sessions
-                    if src['kind'] == 'npz' and sid in allowed_subjects]
+                    if src['kind'] == 'npz'
+                    and (allowed_subjects is None or sid in allowed_subjects)]
         # Attach diagnoses from labels CSV
         lab = pd.read_csv(labels_csv, dtype=str)
         lab['session_z'] = lab['session'].str.zfill(2)
@@ -199,6 +201,9 @@ def main():
     ap.add_argument('--node_p', type=float, default=0.05)
     ap.add_argument('--scale_pct', type=float, default=0.05)
     ap.add_argument('--random_state', type=int, default=42)
+    ap.add_argument('--all_subjects', action='store_true',
+                    help='use all 144 subjects (ignore holdout_json) for a '
+                         'cohort-matched comparison with the baseline/CEBRA')
     args = ap.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -208,10 +213,14 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"  device: {device}")
 
-    with open(args.holdout_json) as f:
-        split = json.load(f)
-    train_pool = set(split['train_pool'])
-    print(f"  train_pool: {len(train_pool)} subjects")
+    if args.all_subjects:
+        train_pool = None
+        print("  all_subjects: using ALL 144 subjects (no holdout filter)")
+    else:
+        with open(args.holdout_json) as f:
+            split = json.load(f)
+        train_pool = set(split['train_pool'])
+        print(f"  train_pool: {len(train_pool)} subjects")
 
     ds = WsmiSupervised(args.data_dir, args.labels_csv, train_pool)
     coords = load_coords(args.coords_file)

@@ -72,16 +72,16 @@ class Classifier(nn.Module):
       per graph. Head input dim = latent_dim in every case.
     """
     def __init__(self, model, model_kind, latent_dim, head='linear',
-                 hidden=32, dropout=0.3):
+                 hidden=32, dropout=0.3, n_classes=3):
         super().__init__()
         self.model = model
         self.is_encoder = model_kind in ENCODER_KINDS
         if head == 'linear':
-            self.clf = nn.Linear(latent_dim, 3)
+            self.clf = nn.Linear(latent_dim, n_classes)
         else:
             self.clf = nn.Sequential(
                 nn.Linear(latent_dim, hidden), nn.ReLU(),
-                nn.Dropout(dropout), nn.Linear(hidden, 3))
+                nn.Dropout(dropout), nn.Linear(hidden, n_classes))
 
     def embed(self, x, edge_index, batch):
         if self.is_encoder:
@@ -119,7 +119,20 @@ def main():
     ap.add_argument('--last_n', type=int, default=100)
     ap.add_argument('--random_state', type=int, default=42)
     ap.add_argument('--tag', default=None)
+    ap.add_argument('--task', choices=['coarse3', 'binary_doc'], default='coarse3',
+                    help='coarse3 = control/low_doc/high_doc (3-class); '
+                         'binary_doc = low_doc(UWS/COMA) vs high_doc(MCS/EMCS), '
+                         'controls dropped -> a dedicated head for the within-DOC '
+                         '(MCS-vs-UWS) boundary')
     args = ap.parse_args()
+
+    # task-specific label maps
+    if args.task == 'binary_doc':
+        LMAP = {'low_doc': 0, 'high_doc': 1}
+        INV_T = {0: 'low_doc', 1: 'high_doc'}
+        NCLS, KEEP = 2, {'low_doc', 'high_doc'}
+    else:
+        LMAP, INV_T, NCLS, KEEP = COARSE, INV, 3, {'control', 'low_doc', 'high_doc'}
 
     torch.manual_seed(args.random_state)
     np.random.seed(args.random_state)
@@ -144,15 +157,16 @@ def main():
                      'session_num': str(getattr(g, 'session_num', '?')),
                      'matrix_idx': int(getattr(g, 'matrix_idx', -1)), 'coarse': c})
     df = pd.DataFrame(rows)
-    df = df[df['coarse'].notna()].sort_values(
+    df = df[df['coarse'].isin(KEEP)].sort_values(
         ['subject_id', 'session_num', 'matrix_idx']).reset_index(drop=True)
     mask = np.asarray(hp.last_n_per_session_mask(df, args.last_n))
     df = df[mask].reset_index(drop=True)
-    y_all = df['coarse'].map(COARSE).to_numpy()
+    y_all = df['coarse'].map(LMAP).to_numpy()
     idx_all = df['idx'].to_numpy()
     subj_all = df['subject_id'].to_numpy()
     print(f"  {len(df)} epochs, {df['subject_id'].nunique()} subjects, "
-          f"mode={args.mode}, head={args.head}, device={device}")
+          f"task={args.task} ({NCLS}-class), mode={args.mode}, head={args.head}, "
+          f"device={device}")
 
     folds = list(GroupKFold(5).split(np.arange(len(df)), groups=subj_all))
     all_proba, fold_rows = [], []
@@ -160,7 +174,8 @@ def main():
     for fi, (tr, te) in enumerate(folds):
         t0 = time.time()
         model, model_kind, cfg = build_model(ckpt_path, device)
-        clf = Classifier(model, model_kind, cfg['latent_dim'], head=args.head).to(device)
+        clf = Classifier(model, model_kind, cfg['latent_dim'], head=args.head,
+                         n_classes=NCLS).to(device)
         if args.mode == 'frozen':
             for p in clf.model.parameters():
                 p.requires_grad = False
@@ -170,9 +185,9 @@ def main():
         opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
 
         ytr = y_all[tr]
-        cnt = np.bincount(ytr, minlength=3).astype(float)
+        cnt = np.bincount(ytr, minlength=NCLS).astype(float)
         cnt[cnt == 0] = 1.0
-        w = torch.tensor(len(ytr) / (3.0 * cnt), dtype=torch.float32, device=device)
+        w = torch.tensor(len(ytr) / (NCLS * cnt), dtype=torch.float32, device=device)
         crit = nn.CrossEntropyLoss(weight=w)
 
         train_graphs = []
@@ -207,41 +222,59 @@ def main():
                 p = torch.softmax(clf(batch.x, batch.edge_index, batch.batch), dim=1)
                 probs.append(p.cpu().numpy())
         probs = np.concatenate(probs, axis=0)
+        pcols = [f'p{k}' for k in range(NCLS)]
         te_df = df.iloc[te].reset_index(drop=True).copy()
-        te_df[['p0', 'p1', 'p2']] = probs
+        te_df[pcols] = probs
 
         f_true, f_pred = [], []
         for sid, sub in te_df.groupby('subject_id'):
-            mp = sub[['p0', 'p1', 'p2']].mean().to_numpy()
+            mp = sub[pcols].mean().to_numpy()
             true = sub['coarse'].iloc[0]
-            pred = INV[int(mp.argmax())]
+            pred = INV_T[int(mp.argmax())]
             f_true.append(true)
             f_pred.append(pred)
+            # write proba in the p_control/p_low_doc/p_high_doc schema compare_roc
+            # expects; binary_doc has no control column -> 0.
+            if args.task == 'binary_doc':
+                rec = {'p_control': 0.0, 'p_low_doc': float(mp[0]),
+                       'p_high_doc': float(mp[1])}
+            else:
+                rec = {'p_control': float(mp[0]), 'p_low_doc': float(mp[1]),
+                       'p_high_doc': float(mp[2])}
             all_proba.append({'subject_id': sid, 'true_dx_coarse': true,
-                              'p_control': float(mp[0]), 'p_low_doc': float(mp[1]),
-                              'p_high_doc': float(mp[2]), 'fold': fi + 1})
+                              **rec, 'fold': fi + 1})
         ba = float(balanced_accuracy_score(f_true, f_pred)) if len(set(f_true)) > 1 else float('nan')
-        fold_rows.append({'fold': fi + 1, 'n_test_subj': len(f_true), 'bal_acc_3': ba})
-        print(f"  fold {fi+1}/5: n_te={len(f_true)}, bal_acc_3={ba:.3f} "
+        fold_rows.append({'fold': fi + 1, 'n_test_subj': len(f_true), 'bal_acc': ba})
+        print(f"  fold {fi+1}/5: n_te={len(f_true)}, bal_acc={ba:.3f} "
               f"({time.time()-t0:.0f}s)")
 
     proba_df = pd.DataFrame(all_proba)
-    pooled_pred = [INV[i] for i in
-                   proba_df[['p_control', 'p_low_doc', 'p_high_doc']].to_numpy().argmax(1)]
-    pooled = float(balanced_accuracy_score(proba_df['true_dx_coarse'], pooled_pred))
     per_fold = pd.DataFrame(fold_rows)
-    mean_ba, std_ba = per_fold['bal_acc_3'].mean(), per_fold['bal_acc_3'].std()
-    print(f"\n  === {args.run_name} finetune {tag} ===")
+    mean_ba, std_ba = per_fold['bal_acc'].mean(), per_fold['bal_acc'].std()
+    print(f"\n  === {args.run_name} finetune {tag} (task={args.task}) ===")
     print(f"    per-fold bal_acc: {mean_ba:.3f} ± {std_ba:.3f}")
-    print(f"    pooled  bal_acc: {pooled:.3f}")
-    print(f"    baseline to beat: 0.611 ± 0.131 (raw PCA+GMM K=3); "
-          f"GMM readout on this encoder ~0.62")
+    auc = None
+    if args.task == 'binary_doc':
+        from sklearn.metrics import roc_auc_score
+        y = (proba_df['true_dx_coarse'] == 'high_doc').astype(int)
+        auc = float(roc_auc_score(y, proba_df['p_high_doc'])) if y.nunique() > 1 else float('nan')
+        pooled_pred = ['high_doc' if p > 0.5 else 'low_doc' for p in proba_df['p_high_doc']]
+        pooled = float(balanced_accuracy_score(proba_df['true_dx_coarse'], pooled_pred))
+        print(f"    pooled  bal_acc: {pooled:.3f}")
+        print(f"    MCS-vs-UWS pooled ROC AUC: {auc:.3f}  (ceiling to break: ~0.71)")
+    else:
+        pooled_pred = [INV_T[i] for i in
+                       proba_df[['p_control', 'p_low_doc', 'p_high_doc']].to_numpy().argmax(1)]
+        pooled = float(balanced_accuracy_score(proba_df['true_dx_coarse'], pooled_pred))
+        print(f"    pooled  bal_acc: {pooled:.3f}")
+        print(f"    baseline to beat: 0.611 (raw PCA+GMM K=3 3-class)")
 
     with open(os.path.join(eval_dir, 'eval_summary.json'), 'w') as f:
         json.dump({'run_name': args.run_name, 'mode': args.mode, 'head': args.head,
                    'args': vars(args),
+                   'task': args.task,
                    'aggregate': {'per_fold_mean': mean_ba, 'per_fold_std': std_ba,
-                                 'pooled': pooled},
+                                 'pooled': pooled, 'mcs_vs_uws_auc': auc},
                    'per_fold': fold_rows}, f, indent=2, default=str)
     proba_df.to_csv(os.path.join(eval_dir, 'per_subject_proba.csv'), index=False)
     print(f"  saved -> {eval_dir}/{{eval_summary.json,per_subject_proba.csv}}")
