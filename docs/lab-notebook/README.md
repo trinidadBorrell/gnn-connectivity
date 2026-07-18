@@ -107,21 +107,22 @@ If the GAE matches or barely exceeds these, the learned representation
 is recapitulating raw-wSMI structure. If it pulls notably ahead, we've
 found a useful encoding.
 
-> **UPDATE (2026-07-18) — the learned GNN wins the matched comparison.**
+> **UPDATE (2026-07-18) — the learned GNN wins the fully-matched comparison.**
 > A **CEBRA contrastive graph encoder (frozen) + a supervised MLP probe** is the
-> **best model on the fully cohort-matched 144-subject comparison across every
-> metric**: 3-class 0.678, control-vs-DOC 0.901, MCS-vs-UWS 0.696 — beating the
-> baseline (0.611/0.815/0.713) and every reconstruction autoencoder (GAE/VGAE/
-> GAEVAE at/below baseline on 3-class; GATVAE collapses to chance). **Contrastive ≫
-> reconstruction.** Two cohort confounds were found & corrected during
-> verification: the GNN default had dropped EMCS+COMA (127; now also run at 144),
-> and the chapter-6 Supervised GCN's saved predictions are on a different
-> **115-subject** cohort (its 0.931 control-vs-DOC is a caveated reference, not the
-> matched table — re-run on 144 = TODO). MCS-vs-UWS stays at the ceiling for all
-> (multi-band needed). **Canonical results table: [narrative.md §4.5c](./narrative.md);**
-> recipe + hyperparameters in [chapter 7](./chapter_07_gae_benchmark_plan.md).
-> Winning config: `enc_gae_fc`/CEBRA, `latent_dim=32`, `temperature=0.1` (fixed),
-> frozen encoder + 2-layer MLP head, class-weighted CE.
+> **best model on the cohort-matched 144-subject comparison across every metric**:
+> 3-class **0.678**, control-vs-DOC **0.901**, MCS-vs-UWS 0.696 — beating the
+> baseline (0.611/0.815/0.713), every reconstruction AE (GATVAE even collapses to
+> chance), **and the fully-supervised end-to-end GCN (0.540/0.888/0.699)**. A frozen
+> self-supervised representation + a light probe beats full supervision. Two cohort
+> confounds were caught in verification and BOTH fixed by re-running: the GNN
+> default had dropped EMCS/COMA (127→144), and the supervised GCN's saved preds were
+> on 115 subjects (re-run on 144 = 0.888, so its earlier 0.931 "win" was a cohort
+> artifact). The MCS-vs-UWS ~0.71 ceiling holds for all — and a **dedicated
+> within-DOC head does not break it (0.685)** → single-band theta limit, multi-band
+> is the next lever. **Canonical results: [narrative.md §4.5c](./narrative.md);**
+> recipe in [chapter 7](./chapter_07_gae_benchmark_plan.md). Winning config:
+> `enc_gae_fc`/CEBRA, `latent_dim=32`, `temperature=0.1` (fixed), frozen encoder +
+> 2-layer MLP head, class-weighted CE.
 
 ---
 

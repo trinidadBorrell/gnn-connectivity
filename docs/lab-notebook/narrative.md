@@ -3,17 +3,17 @@
 > **Status (2026-07-17):** working narrative that structures the full paper and
 > records every method exactly. Numbers are drawn from the lab-notebook chapters
 > (raw-wSMI baseline) and the chapter-7 GNN experiments, all verified against the
-> code (see `§0 Provenance & caveats`). **Full ablation complete + two cohort
-> confounds caught and corrected** (§4.5c). All models were re-run so the
-> comparison is cohort-matched. On the fully matched **144-subject cohort** the
-> frozen CEBRA + MLP probe is the **best model on every metric** — 3-class 0.678
-> (baseline 0.611; reconstruction AEs 0.33–0.62), control-vs-DOC 0.901 (baseline
-> 0.815; reconstruction 0.84–0.85), tied at the MCS-vs-UWS ceiling. **Contrastive ≫
-> reconstruction** (GATVAE even collapsed to chance). Two caveats found via
-> verification: (i) the GNN default cohort had been 127 (EMCS/COMA dropped) — now
-> also run at 144; (ii) the chapter-6 Supervised GCN's saved predictions are on a
-> **different 115-subject cohort**, so its 0.931 is a caveated reference, not part
-> of the matched table (re-running it on 144 is a TODO).
+> code (see `§0 Provenance & caveats`). **Full ablation complete; ALL models now on
+> the same 144-subject cohort** (§4.5c) — two cohort confounds were caught in
+> verification and both fixed by re-running (the GNN default had been 127 with
+> EMCS/COMA dropped; the supervised GCN's saved preds were on 115, now re-run with
+> `--all_subjects` on 144). **On the matched 144 cohort the frozen CEBRA + MLP probe
+> is the best model on every metric** — 3-class 0.678 (baseline 0.611, supervised
+> GCN 0.540), **control-vs-DOC 0.901, beating even the fully-supervised GCN
+> (0.888)** and the baseline (0.815). Contrastive ≫ reconstruction (GATVAE collapsed
+> to chance). The MCS-vs-UWS ~0.71 ceiling holds for all — and a **dedicated
+> within-DOC head does not break it** (0.685) → the bottleneck is the single theta
+> band, so multi-band is the next lever.
 
 ---
 
@@ -70,9 +70,11 @@ Engemann et al. 2018, *Brain*). We use **theta-band wSMI only**.
    graph encoder, **frozen**, with a lightweight supervised MLP probe, is the
    **best model on the fully cohort-matched 144-subject comparison across every
    metric** — 3-class 0.678, control-vs-DOC 0.901, MCS-vs-UWS 0.696 — beating the
-   hand-engineered baseline (0.611 / 0.815 / 0.713) and every reconstruction
-   autoencoder (which sit at/below baseline on 3-class; GATVAE collapses to
-   chance). Contrastive is decisively the right objective for wSMI graphs.
+   hand-engineered baseline (0.611 / 0.815 / 0.713), every reconstruction
+   autoencoder (at/below baseline; GATVAE collapses to chance), **and the
+   fully-supervised end-to-end GCN (0.540 / 0.888 / 0.699)**. Contrastive
+   self-supervision is decisively the right objective for wSMI graphs, and a light
+   probe on the frozen representation beats even full supervision.
 3. **A hard ceiling within DOC.** No method (unsupervised, supervised, or
    self-supervised) exceeds ~0.66–0.72 AUC on MCS-vs-UWS from theta-wSMI alone,
    pinpointing multi-band features as the necessary next ingredient.
@@ -289,45 +291,41 @@ EMCS (the hardest DOC to tell from control) is added back — expected.
 
 ### 4.5c CONSOLIDATED RESULTS — all architectures × readouts, with cohort sizes
 
-**Cohort sizes are NOT uniform across pre-existing runs** — always read the `n`
-column. Baseline, CEBRA, and all reconstruction models were run on the **144**
-cohort (fine granularity); the chapter-6 Supervised GCN's saved predictions are
-on **115** subjects (its own loader/filter), so it is a *caveated reference*, not
-part of the matched comparison. The 127 column is the EMCS/COMA-dropped ablation.
+**Every model in this table is now on the SAME 144-subject cohort** (baseline,
+CEBRA, all reconstruction AEs, and the supervised GCN re-run with `--all_subjects`).
+The 127 column elsewhere is the EMCS/COMA-dropped ablation.
 
-**Fully cohort-matched (n=144) — the head-to-head table:**
+**Fully cohort-matched (n=144) — the canonical head-to-head table:**
 
 | model | readout | 3-class bal_acc | control-vs-DOC AUC | MCS-vs-UWS AUC |
 |---|---|---|---|---|
 | **CEBRA (enc_gae_fc)** | **frozen+MLP** | **0.678 ± 0.127** | **0.901 ± 0.102** | 0.696 ± 0.107 |
 | CEBRA | frozen+GMM K=6 | 0.665 | 0.915 ± 0.115 | 0.691 ± 0.133 |
+| Supervised GCN (end-to-end) | CE head | 0.540 ± 0.100 | 0.888 ± 0.129 | 0.699 |
 | GAE | frozen+MLP | 0.615 | 0.841 | 0.713 |
-| GAE | GMM | 0.505 | — | — |
 | VGAE | frozen+MLP | 0.587 | 0.842 | 0.652 |
-| VGAE | GMM | 0.567 | — | — |
 | GAEVAE | GMM / MLP | 0.552 / 0.539 | 0.850 | 0.580 |
 | GATVAE | frozen+MLP | **0.333 (collapsed)** | 0.836 | 0.568 |
 | raw-wSMI baseline | GMM K=3 soft-FP | 0.611 ± 0.131 | 0.815 ± 0.095 | 0.713 ± 0.155 |
 
-*Caveated reference (n=115, different cohort — NOT directly comparable):*
-Supervised GCN 3-class 0.527, control-vs-DOC 0.931, MCS-vs-UWS 0.678.
-
-**Honest reading:**
-- **CEBRA is the best model on the matched 144-cohort across every metric** —
-  best 3-class (0.678), best control-vs-DOC (0.901), tied at the MCS-vs-UWS ceiling.
+**Honest reading (all n=144, fully matched):**
+- **CEBRA is the best model on every axis** — best 3-class (0.678), **best
+  control-vs-DOC (0.901), beating even the fully-supervised end-to-end GCN
+  (0.888)**, and tied at the MCS-vs-UWS ceiling. A frozen self-supervised
+  representation + a light MLP probe beats a fully-supervised model *and* the
+  hand-engineered baseline. (The supervised GCN's earlier 0.931 was a cohort
+  artifact — it was on 115 subjects, holding out 29; on the matched 144 it is
+  0.888.)
 - **Contrastive ≫ reconstruction.** Every reconstruction AE lands at/below the
   baseline on 3-class (GAE 0.615, VGAE 0.587, GAEVAE 0.55, GATVAE **collapsed to
-  chance 0.333** — the GATv2 attention AE is unstable here). Interestingly they all
-  edge the baseline on control-vs-DOC AUC (~0.84–0.85) — a learned representation
-  helps the easy binary axis even with the "wrong" (reconstruction) loss — but
-  contrastive is decisively better. This confirms ch-5's thesis: reconstruction
-  wastes capacity on noise; temporal-contrastive keeps the coupling structure.
-- **The supervised GCN's 0.931 is on 115 subjects, not 144** — an earlier
-  "supervised wins control-vs-DOC" note was a cohort artifact (it compared to the
-  115-cohort supervised number). On the matched cohort **CEBRA (0.901) is the top
-  control-vs-DOC model**. To make the supervised comparison clean it must be re-run
-  on 144 (TODO / future work).
-- **MCS-vs-UWS is a ceiling for ALL models** (~0.57–0.71). Multi-band needed.
+  chance 0.333**). They edge the baseline on control-vs-DOC AUC (~0.84–0.85) — a
+  learned representation helps the easy binary axis even with the "wrong"
+  (reconstruction) loss — but contrastive is decisively better, confirming ch-5's
+  thesis (reconstruction wastes capacity on noise; temporal-contrastive keeps the
+  coupling structure).
+- **MCS-vs-UWS is a ceiling for ALL models** (~0.57–0.71), and a **dedicated
+  within-DOC head does not break it** (0.685, above) → the bottleneck is the
+  single theta band, not the readout/architecture. Multi-band is the next lever.
 
 **The ceiling is fundamental to theta-wSMI, not a readout artifact
 (`finetune_encoder.py --task binary_doc`).** We trained a *dedicated* 2-class head

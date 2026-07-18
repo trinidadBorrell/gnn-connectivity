@@ -85,20 +85,20 @@ last-100 epochs/session:**
 > vs supervised-144). We re-ran **every method on both cohorts**. Corrected,
 > cohort-matched results:
 >
-> | frozen probe, 3-class / ctrl-vs-DOC | Baseline (n=144) | CEBRA (n=144) | Supervised GCN (n=115!) |
+> | 3-class / ctrl-vs-DOC (all n=144, matched) | Baseline | CEBRA frozen+probe | Supervised GCN |
 > |---|---|---|---|
-> | **144-cohort (matched)** | 0.611 / 0.815 | **0.678 / 0.901** | 0.527 / 0.931 |
-> | 127-cohort | 0.551 / 0.810 | 0.673 / 0.940 | — |
+> | **144-cohort (matched)** | 0.611 / 0.815 | **0.678 / 0.901** | 0.540 / 0.888 |
+> | 127-cohort (ablation) | 0.551 / 0.810 | 0.673 / 0.940 | — |
 >
-> **Corrected reading (TWO cohort confounds found & fixed):** on the matched
-> 144-cohort CEBRA is the **best model on every metric** — best 3-class (0.678) and
-> best control-vs-DOC (0.901 vs baseline 0.815). The **Supervised GCN's 0.931 is on
-> a DIFFERENT 115-subject cohort** (its own loader), so it is a caveated reference,
-> NOT the top of the matched table — re-run it on 144 for a clean comparison (TODO).
-> The full architecture ablation (GAE/VGAE/GAEVAE/GATVAE, all n=144) is in
-> [narrative.md §4.5c](./narrative.md); reconstruction AEs all sit ≤ baseline on
-> 3-class (GATVAE collapsed to chance 0.333). **Use narrative.md §4.5c as the
-> canonical results table.**
+> **Final reading (TWO cohort confounds found & fixed — all models now n=144):**
+> CEBRA is the **best model on every metric** — best 3-class (0.678) and best
+> control-vs-DOC (0.901), **beating even the fully-supervised GCN (0.888)**. The
+> supervised GCN's earlier 0.931 was a cohort artifact (it was on 115 subjects,
+> holding out 29); re-run on all 144 (`--all_subjects`) it is 0.888. Reconstruction
+> AEs all sit ≤ baseline on 3-class (GATVAE collapsed to chance 0.333). A dedicated
+> within-DOC head does NOT break the ~0.71 MCS-vs-UWS ceiling (0.685) → single-band
+> limit, not readout. **Use [narrative.md §4.5c](./narrative.md) as the canonical
+> results table.**
 
 **The winning pipeline** = *contrastive pretrain → freeze → supervised MLP probe*:
 
