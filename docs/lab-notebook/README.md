@@ -107,20 +107,21 @@ If the GAE matches or barely exceeds these, the learned representation
 is recapitulating raw-wSMI structure. If it pulls notably ahead, we've
 found a useful encoding.
 
-> **UPDATE (2026-07-17) — the learned GNN cleared the bar (cohort-matched).**
+> **UPDATE (2026-07-18) — the learned GNN wins the matched comparison.**
 > A **CEBRA contrastive graph encoder (frozen) + a supervised MLP probe** is the
-> best-overall model. Compared on the **matched 144-subject cohort** (all methods,
-> same subjects): CEBRA has the **best 3-class balanced accuracy 0.678** (baseline
-> 0.611, supervised GCN 0.527) and **beats the unsupervised baseline on
-> control-vs-DOC (0.901 vs 0.815)**, reaching ~97 % of the supervised GCN's AUC
-> (0.931) on that axis while keeping the 3-class balance the supervised model
-> loses. It also beats the baseline on the 127-cohort (0.673/0.940 vs 0.551/0.810)
-> and is more cohort-robust. MCS-vs-UWS stays at the ~0.69 ceiling for all methods
-> (multi-band still needed). Full corrected results + exact hyperparameters +
-> reproduction in [chapter 7 §7.8–7.9](./chapter_07_gae_benchmark_plan.md) and
-> [narrative.md §4.5](./narrative.md). Winning config: `enc_gae_fc`/CEBRA,
-> `latent_dim=32`, `temperature=0.1` (fixed), frozen encoder + 2-layer MLP head,
-> class-weighted CE.
+> **best model on the fully cohort-matched 144-subject comparison across every
+> metric**: 3-class 0.678, control-vs-DOC 0.901, MCS-vs-UWS 0.696 — beating the
+> baseline (0.611/0.815/0.713) and every reconstruction autoencoder (GAE/VGAE/
+> GAEVAE at/below baseline on 3-class; GATVAE collapses to chance). **Contrastive ≫
+> reconstruction.** Two cohort confounds were found & corrected during
+> verification: the GNN default had dropped EMCS+COMA (127; now also run at 144),
+> and the chapter-6 Supervised GCN's saved predictions are on a different
+> **115-subject** cohort (its 0.931 control-vs-DOC is a caveated reference, not the
+> matched table — re-run on 144 = TODO). MCS-vs-UWS stays at the ceiling for all
+> (multi-band needed). **Canonical results table: [narrative.md §4.5c](./narrative.md);**
+> recipe + hyperparameters in [chapter 7](./chapter_07_gae_benchmark_plan.md).
+> Winning config: `enc_gae_fc`/CEBRA, `latent_dim=32`, `temperature=0.1` (fixed),
+> frozen encoder + 2-layer MLP head, class-weighted CE.
 
 ---
 

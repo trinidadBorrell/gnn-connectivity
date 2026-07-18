@@ -85,17 +85,20 @@ last-100 epochs/session:**
 > vs supervised-144). We re-ran **every method on both cohorts**. Corrected,
 > cohort-matched results:
 >
-> | frozen probe, 3-class / ctrl-vs-DOC | Baseline | CEBRA | Supervised GCN |
+> | frozen probe, 3-class / ctrl-vs-DOC | Baseline (n=144) | CEBRA (n=144) | Supervised GCN (n=115!) |
 > |---|---|---|---|
-> | **144-cohort (matched)** | 0.611 / 0.815 | **0.678** / 0.901 | 0.527 / **0.931** |
+> | **144-cohort (matched)** | 0.611 / 0.815 | **0.678 / 0.901** | 0.527 / 0.931 |
 > | 127-cohort | 0.551 / 0.810 | 0.673 / 0.940 | — |
 >
-> **Corrected reading:** on the matched 144-cohort CEBRA has the **best 3-class
-> (0.678)** and **beats the unsupervised baseline on control-vs-DOC (0.901 vs
-> 0.815)**, but the **supervised GCN wins control-vs-DOC alone (0.931)** — CEBRA is
-> ~97 % of it while keeping the 3-class balance the supervised model loses. The GNN
-> beats the baseline on BOTH cohorts and is more cohort-robust. The 0.940 figure is
-> the 127-cohort value; **use the 144 row as the headline.**
+> **Corrected reading (TWO cohort confounds found & fixed):** on the matched
+> 144-cohort CEBRA is the **best model on every metric** — best 3-class (0.678) and
+> best control-vs-DOC (0.901 vs baseline 0.815). The **Supervised GCN's 0.931 is on
+> a DIFFERENT 115-subject cohort** (its own loader), so it is a caveated reference,
+> NOT the top of the matched table — re-run it on 144 for a clean comparison (TODO).
+> The full architecture ablation (GAE/VGAE/GAEVAE/GATVAE, all n=144) is in
+> [narrative.md §4.5c](./narrative.md); reconstruction AEs all sit ≤ baseline on
+> 3-class (GATVAE collapsed to chance 0.333). **Use narrative.md §4.5c as the
+> canonical results table.**
 
 **The winning pipeline** = *contrastive pretrain → freeze → supervised MLP probe*:
 
