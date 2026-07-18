@@ -329,6 +329,20 @@ Supervised GCN 3-class 0.527, control-vs-DOC 0.931, MCS-vs-UWS 0.678.
   on 144 (TODO / future work).
 - **MCS-vs-UWS is a ceiling for ALL models** (~0.57–0.71). Multi-band needed.
 
+**The ceiling is fundamental to theta-wSMI, not a readout artifact
+(`finetune_encoder.py --task binary_doc`).** We trained a *dedicated* 2-class head
+(low_doc vs high_doc, controls dropped, 130 DOC subjects) that optimizes the
+within-DOC boundary directly with cross-entropy — instead of deriving the
+MCS-vs-UWS AUC post-hoc from the 3-class head. Result on the CEBRA-144 encoder:
+**MCS-vs-UWS ROC AUC 0.685** (bal_acc 0.683 ± 0.025) — **it does NOT beat the
+~0.71 ceiling**; it matches the post-hoc 3-class-derived 0.696 and the baseline
+0.713. Optimizing a head *specifically* for the hard axis doesn't help → the
+within-DOC bottleneck is in the **signal (single theta band)**, not the readout or
+architecture. This is the cleanest evidence yet that **multi-band wSMI** (Sitt
+2014's α/β/δ/γ + θ panel) is the necessary next ingredient, not more model
+engineering. (Nuance: the dedicated head has much tighter fold variance,
+±0.025 vs ±0.107 — a more *reliable* estimator at the same mean.)
+
 **Readout ablation (all within the 127-cohort, so internally valid):**
 
 | readout on CEBRA d=32 | 3-class bal_acc |
