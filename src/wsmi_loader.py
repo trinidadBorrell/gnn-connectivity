@@ -346,12 +346,23 @@ def load_wsmi_dataset_npz(
     seen = set()  # dedupe (subject, session) across roots
     n_files = n_epochs = n_dropped = n_skipped_ctrl = 0
 
+    import time as _time
+    _t0 = _time.time()
     for root in roots:
         if not root or not os.path.isdir(root):
             if verbose:
                 print(f"  skipping missing folder: {root}")
             continue
-        for sub_id, ses, source in EEGtoGraph.enumerate_matrix_sessions(root):
+        if verbose:
+            print(f"  [npz-loader] enumerating sessions under {root} ...", flush=True)
+        _sessions = EEGtoGraph.enumerate_matrix_sessions(root)
+        if verbose:
+            print(f"  [npz-loader] found {len(_sessions)} sessions "
+                  f"({_time.time()-_t0:.1f}s); building graphs", flush=True)
+        for sub_id, ses, source in _sessions:
+            if verbose and n_files > 0 and n_files % 20 == 0:
+                print(f"  [npz-loader] {n_files} sessions read, {n_epochs} graphs, "
+                      f"{_time.time()-_t0:.1f}s elapsed", flush=True)
             if source.get("kind") != "npz":
                 continue
             if subject_filter is not None and sub_id not in subject_filter:
