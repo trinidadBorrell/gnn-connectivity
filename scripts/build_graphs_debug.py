@@ -12,19 +12,28 @@ CPU partition (no --gres). Every print is flushed so `tail -f` shows live progre
 import os, sys, time
 os.environ["CUDA_VISIBLE_DEVICES"] = ""   # <- no CUDA init; isolates the GPU-hang hypothesis
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
+# matplotlib pyplot (imported by preprocessing.py -> mne) builds a font cache in
+# $HOME/.cache on first run -> a classic silent hang on NFS/headless nodes.
+# Force headless backend + node-local cache dir BEFORE any matplotlib import.
+os.environ["MPLBACKEND"] = "Agg"
+os.environ["MPLCONFIGDIR"] = f"/tmp/mplcfg_{os.environ.get('USER', 'x')}"
+os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
 
 def log(m):
     print(f"[{time.strftime('%H:%M:%S')}] {m}", flush=True)
 
-log(f"START  CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']!r}  host={os.uname().nodename}")
-t = time.time(); import numpy as np;            log(f"import numpy           {time.time()-t:5.1f}s")
-t = time.time(); import pandas as pd;           log(f"import pandas          {time.time()-t:5.1f}s")
-t = time.time(); import torch;                  log(f"import torch           {time.time()-t:5.1f}s  cuda_avail={torch.cuda.is_available()}")
-t = time.time(); import torch_geometric;        log(f"import torch_geometric {time.time()-t:5.1f}s")
+log(f"START  CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']!r}  "
+    f"MPLCONFIGDIR={os.environ['MPLCONFIGDIR']}  host={os.uname().nodename}")
+t = time.time(); import numpy as np;            log(f"import numpy            {time.time()-t:5.1f}s")
+t = time.time(); import pandas as pd;           log(f"import pandas           {time.time()-t:5.1f}s")
+t = time.time(); import torch;                  log(f"import torch            {time.time()-t:5.1f}s  cuda_avail={torch.cuda.is_available()}")
+t = time.time(); import torch_geometric;        log(f"import torch_geometric  {time.time()-t:5.1f}s")
+t = time.time(); import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt; log(f"import matplotlib.pyplot {time.time()-t:5.1f}s")
+t = time.time(); import mne;                     log(f"import mne              {time.time()-t:5.1f}s")
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_HERE, '..', 'src'))
-t = time.time(); from wsmi_loader import load_wsmi_dataset_npz; log(f"import wsmi_loader     {time.time()-t:5.1f}s")
+t = time.time(); from wsmi_loader import load_wsmi_dataset_npz; log(f"import wsmi_loader      {time.time()-t:5.1f}s")
 from data_loaders import split_by_subject_stratified
 
 import argparse
