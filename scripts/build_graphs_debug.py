@@ -16,8 +16,13 @@ os.environ.setdefault("PYTHONUNBUFFERED", "1")
 # $HOME/.cache on first run -> a classic silent hang on NFS/headless nodes.
 # Force headless backend + node-local cache dir BEFORE any matplotlib import.
 os.environ["MPLBACKEND"] = "Agg"
-os.environ["MPLCONFIGDIR"] = f"/tmp/mplcfg_{os.environ.get('USER', 'x')}"
+_u = os.environ.get('USER', 'x')
+os.environ["MPLCONFIGDIR"] = f"/tmp/mplcfg_{_u}"
+# fontconfig caches to $XDG_CACHE_HOME (default ~/.cache on NFS $HOME) — that is
+# what actually hangs during matplotlib's font scan. Redirect it to node-local /tmp.
+os.environ["XDG_CACHE_HOME"] = f"/tmp/xdgcache_{_u}"
 os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
+os.makedirs(os.environ["XDG_CACHE_HOME"], exist_ok=True)
 
 def log(m):
     print(f"[{time.strftime('%H:%M:%S')}] {m}", flush=True)
