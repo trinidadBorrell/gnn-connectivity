@@ -34,12 +34,17 @@ the GNN is a **statistical wash with the baseline**, with tighter 5-fold varianc
 | **Tuned CEBRA GNN** | **0.877 ± 0.085** | 0.660 ± **0.065** |
 | Supervised GCN (ch 6) | 0.931 ± 0.083 | 0.678 ± 0.155 |
 
-**Headline:** the tuned CEBRA graph encoder **beats the unsupervised GMM baseline
-on control-vs-DOC (+0.06 AUC), unsupervised** — sitting between the baseline and
-the fully-supervised model — and is the **most stable** model (tightest variance
-on both binary tasks). The **MCS-vs-UWS ceiling (~0.66–0.72) holds for every
-method** → the within-DOC boundary needs multi-band features, not more encoder
-tuning (§7.6 lever #2).
+> **⚠️ §7.8–7.8b are the 127-cohort progression (EMCS/COMA dropped).** The tight
+> std here (±0.05–0.07) is a 127-cohort property that did NOT survive the
+> cohort correction — on the matched 144-cohort every model's fold variance is
+> larger (~0.09–0.13) and no model is uniquely tightest. **Use
+> [narrative.md §4.5c](./narrative.md) for the canonical mean ± std table.**
+
+**Headline (127-cohort):** the tuned CEBRA graph encoder **beats the unsupervised
+GMM baseline on control-vs-DOC (+0.06 AUC), unsupervised**. The **MCS-vs-UWS
+ceiling (~0.66–0.72) holds for every method** → the within-DOC boundary needs
+multi-band features, not more encoder tuning (§7.6 lever #2). *(The "most stable /
+tightest variance" reading here is 127-cohort only; see §4.5c.)*
 
 ### 7.8b THE WINNER — frozen CEBRA + supervised MLP probe (`finetune_encoder.py`)
 
@@ -56,11 +61,12 @@ params on ~127 subjects.
 | — vs raw baseline | 0.611 ± 0.131 | 0.815 ± 0.095 | 0.713 ± 0.155 |
 | — vs supervised GCN | 0.527 | 0.931 ± 0.083 | 0.678 ± 0.155 |
 
-**The frozen-SSL + MLP-probe recipe wins on every axis** — 3-class 0.673 (best),
-and **control-vs-DOC 0.940, the highest of ANY method, beating even the fully
-supervised end-to-end GCN (0.931)**, with the tightest variance. MCS-vs-UWS 0.693
-sits at the universal ceiling but is the most stable. This is the "good GNN
-result": *contrastive pretrain → freeze → supervised probe* outperforms both the
+**The frozen-SSL + MLP-probe recipe wins on every axis (127-cohort numbers here;
+see §4.5c for the matched 144-cohort).** 3-class 0.673, control-vs-DOC 0.940.
+*(Note: the "beats supervised 0.931 / tightest variance" reading is a 127-cohort
+artifact — on the matched 144-cohort CEBRA is 0.901 vs supervised 0.888, and no
+model is uniquely tightest. §4.5c is canonical.)* This is the "good GNN result":
+*contrastive pretrain → freeze → supervised probe* outperforms both the
 hand-engineered PCA+GMM baseline and a supervised GCN on the clean axis, from
 theta-wSMI alone. (Caveat: control-vs-DOC has 2–4 controls/fold → confirm 0.94
 with LOOCV / a second seed.)

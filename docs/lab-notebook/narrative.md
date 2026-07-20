@@ -276,7 +276,9 @@ comparison is complete; the GNN-144 cell is the final in-flight run (job 373415)
 **Cohort-controlled results — frozen CEBRA (d=32, τ=0.1) + MLP probe vs raw-wSMI
 GMM baseline vs supervised GCN. All CV subject-disjoint 5-fold.**
 
-Cohort-effect 2×2 (frozen probe vs GMM baseline), 3-class / control-vs-DOC AUC:
+Cohort-effect 2×2 (frozen probe vs GMM baseline) — **means only** (3-class /
+control-vs-DOC AUC), to show the cohort shift; full mean ± std is in the canonical
+table below:
 
 | cohort | Baseline (GMM) | CEBRA frozen + MLP probe |
 |---|---|---|
@@ -295,27 +297,34 @@ EMCS (the hardest DOC to tell from control) is added back — expected.
 CEBRA, all reconstruction AEs, and the supervised GCN re-run with `--all_subjects`).
 The 127 column elsewhere is the EMCS/COMA-dropped ablation.
 
-**Fully cohort-matched (n=144) — the canonical head-to-head table:**
+**Fully cohort-matched (n=144) — the canonical head-to-head table.** All values are
+**mean ± std across the SAME 5 subject-disjoint folds**, computed uniformly by
+`scripts/compare_roc.py` (single source, so std is consistent across rows). Probe
+= frozen encoder + MLP head.
 
-| model | readout | 3-class bal_acc | control-vs-DOC AUC | MCS-vs-UWS AUC |
-|---|---|---|---|---|
-| **CEBRA (enc_gae_fc)** | **frozen+MLP** | **0.678 ± 0.127** | **0.901 ± 0.102** | 0.696 ± 0.107 |
-| CEBRA | frozen+GMM K=6 | 0.665 | 0.915 ± 0.115 | 0.691 ± 0.133 |
-| Supervised GCN (end-to-end) | CE head | 0.540 ± 0.100 | 0.888 ± 0.129 | 0.699 |
-| GAE | frozen+MLP | 0.615 | 0.841 | 0.713 |
-| VGAE | frozen+MLP | 0.587 | 0.842 | 0.652 |
-| GAEVAE | GMM / MLP | 0.552 / 0.539 | 0.850 | 0.580 |
-| GATVAE | frozen+MLP | **0.333 (collapsed)** | 0.836 | 0.568 |
-| raw-wSMI baseline | GMM K=3 soft-FP | 0.611 ± 0.131 | 0.815 ± 0.095 | 0.713 ± 0.155 |
+| model | 3-class bal_acc | control-vs-DOC AUC | MCS-vs-UWS AUC |
+|---|---|---|---|
+| **CEBRA (enc_gae_fc) frozen+MLP** | **0.678 ± 0.114** | **0.901 ± 0.102** | 0.696 ± 0.107 |
+| Supervised GCN (end-to-end) | 0.540 ± 0.089 | 0.888 ± 0.129 | 0.699 ± 0.103 |
+| GAE frozen+MLP | 0.615 ± 0.111 | 0.841 ± 0.108 | 0.713 ± 0.102 |
+| VGAE frozen+MLP | 0.587 ± 0.092 | 0.842 ± 0.110 | 0.652 ± 0.160 |
+| GAEVAE frozen+MLP | 0.539 ± 0.113 | 0.850 ± 0.104 | 0.580 ± 0.124 |
+| GATVAE frozen+MLP | **0.333 ± 0.000** (collapsed) | 0.836 ± 0.101 | 0.568 ± 0.230 |
+| raw-wSMI baseline (GMM K=3 soft-FP) | 0.611 ± 0.117 | 0.815 ± 0.095 | 0.713 ± 0.155 |
 
 **Honest reading (all n=144, fully matched):**
-- **CEBRA is the best model on every axis** — best 3-class (0.678), **best
+- **CEBRA wins on the means of every axis** — best 3-class (0.678), **best
   control-vs-DOC (0.901), beating even the fully-supervised end-to-end GCN
-  (0.888)**, and tied at the MCS-vs-UWS ceiling. A frozen self-supervised
+  (0.888)**, tied at the MCS-vs-UWS ceiling. A frozen self-supervised
   representation + a light MLP probe beats a fully-supervised model *and* the
   hand-engineered baseline. (The supervised GCN's earlier 0.931 was a cohort
-  artifact — it was on 115 subjects, holding out 29; on the matched 144 it is
-  0.888.)
+  artifact — 115 subjects; on matched 144 it is 0.888.)
+- **On std, no model is uniformly tightest on 144.** CEBRA had the smallest std on
+  the 127-cohort (±0.057–0.070), but restoring EMCS/COMA (the ambiguous extremes)
+  widened every model's fold variance. On 144 the tightest 3-class std is the
+  supervised GCN's (0.089) and the tightest control-vs-DOC std is the baseline's
+  (0.095); CEBRA's are mid-pack (0.10–0.11). CEBRA's advantage is in the **means**,
+  not the variance, on the full cohort.
 - **Contrastive ≫ reconstruction.** Every reconstruction AE lands at/below the
   baseline on 3-class (GAE 0.615, VGAE 0.587, GAEVAE 0.55, GATVAE **collapsed to
   chance 0.333**). They edge the baseline on control-vs-DOC AUC (~0.84–0.85) — a
@@ -360,6 +369,31 @@ engineering. (Nuance: the dedicated head has much tighter fold variance,
   default 1.0 is far too soft and was why out-of-the-box CEBRA failed (0.471).
 - **seed robustness** (frozen probe, d=32): seed 42 → 0.673, seed 7 → 0.647 →
   robust ~0.66.
+
+### 4.5d Data window — last-100 epochs/session (baseline AND GNN), and all-vs-last
+
+**Both the baseline and the GNN use the same window: the last 100 epochs/session**
+(~80 s at the end of each recording, `--max_epochs_per_recording 100` →
+`wsmi_loader.py:403` takes `range(n_ep-100, n_ep)`). There is **no "first-150"
+subset** — the "150" is `--train_epochs` (the number of gradient-descent passes,
+i.e. optimization iterations), a completely separate quantity from data epochs.
+
+**Why last-100, and is using all the data worse?** For the baseline we *have* the
+all-data numbers, and **yes, using everything is worse**: chapter-3's partition
+sweep (fixed GMM) gives Cramér's V **0.219 (last-100)** vs **0.183 (all epochs)**
+vs 0.181 (middle-100) vs 0.201 (random-100). The end-of-recording window is the
+most discriminative (subjects settled, less artefact / drowsiness contrast), so
+last-100 is a principled choice, not just a memory shortcut. The GNN inherits the
+same window so the comparison is apples-to-apples.
+
+**GNN on all epochs: untested (memory).** At 256 nodes the last-100 `graphs.pt` is
+already ~9 GB; all ~132k epochs would be ~68 GB (OOM). For the CEBRA encoder more
+epochs = more temporal (i, i+1) contrastive pairs, which *could* help the
+representation — but the eval readout stays on last-100 (the discriminative
+window) regardless. Testing a larger window (e.g. last-300, ~27 GB) or all-epochs
+(needs the mmap `lazy_dataset.py`) is a clean, cheap follow-up — **flagged as a
+TODO**; given the baseline is *worse* with all data, the prior is that last-100 is
+also right for the GNN, but it's worth confirming.
 
 ### 4.6 The within-DOC ceiling (all methods)
 Every method — unsupervised GMM (0.713), supervised GCN (0.678), CEBRA frozen
